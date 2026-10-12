@@ -12,11 +12,17 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+
   api:
-    build: .
+    image: chatbotai-app:latest
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
     restart: unless-stopped
     env_file: .env
     command: sh -c "npx prisma db push && node server/src/api.js"
@@ -24,22 +30,22 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_started}
+
   worker:
-    build: .
+    image: chatbotai-app:latest
     restart: unless-stopped
     env_file: .env
     command: node server/src/worker.js
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_started}
+
   web:
-    build:
-      context: .
-      args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+    image: chatbotai-app:latest
     restart: unless-stopped
     command: npm run start:web
     ports: ["127.0.0.1:3000:3000"]
     depends_on: [api]
+
 volumes:
   postgres_data:
