@@ -1,0 +1,6 @@
+.git
+.env
+node_modules
+web/.next
+npm-debug.log*
+*.log
