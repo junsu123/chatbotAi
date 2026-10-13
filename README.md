@@ -107,19 +107,52 @@ META_REDIRECT_URI=https://ai.tenmiencuaban.com/auth/facebook/callback
 
 OpenAI API Key không cần để trong `.env`; Super Admin nhập trong Dashboard → OpenAI.
 
-## 3. Build và nâng cấp database
+## 3. Build nhanh bằng Docker cache
+
+Dockerfile V2.1 được chia thành các stage độc lập để tránh build lại phần không thay đổi:
+
+- `package*.json` không đổi → không chạy lại `npm install`;
+- chỉ sửa `server/*` → không build lại Next.js và không chạy lại Prisma generate;
+- chỉ sửa `prisma/*` → chỉ regenerate Prisma, web build vẫn dùng cache;
+- chỉ sửa `web/*` → build lại Next.js nhưng vẫn dùng npm cache và `.next/cache` của BuildKit;
+- API / worker / web tiếp tục dùng chung một image `chatbotai-app:latest`.
+
+Build/deploy bình thường:
 
 ```bash
 cd ~/chatbotAi
-sudo docker compose stop api worker web
+git pull
 sudo docker compose build api
+sudo docker compose up -d --no-build
+```
+
+Lần đầu sau khi đổi sang Dockerfile tối ưu vẫn có thể lâu vì cache chưa tồn tại. Từ lần thứ hai, các bước không đổi phải hiện `CACHED` và nhanh hơn rõ rệt.
+
+**Không dùng thường xuyên** các lệnh sau vì chúng xóa cache và làm lần build kế tiếp chậm như build mới:
+
+```bash
+sudo docker compose build --no-cache api
+sudo docker builder prune -af
+sudo docker system prune -af
+```
+
+Chỉ prune khi ổ đĩa thực sự thiếu dung lượng. Có thể kiểm tra trước bằng:
+
+```bash
+df -h /
+sudo docker system df
+```
+
+## 4. Nâng cấp database
+
+```bash
 sudo docker compose up -d postgres redis
 sudo docker compose run --rm api npx prisma db push
 ```
 
 Không dùng `--accept-data-loss` nếu Prisma cảnh báo xóa dữ liệu mà bạn chưa kiểm tra.
 
-## 4. Tạo / cập nhật Super Admin
+## 5. Tạo / cập nhật Super Admin
 
 ```bash
 sudo docker compose run --rm api npm run admin:create
@@ -143,10 +176,10 @@ Lệnh này:
 - gán Page cũ chưa có owner cho Super Admin;
 - không tạo ví tiền.
 
-## 5. Khởi động V2.1
+## 6. Khởi động V2.1
 
 ```bash
-sudo docker compose up -d
+sudo docker compose up -d --no-build
 sudo docker compose ps
 curl http://127.0.0.1:4000/health
 ```
@@ -157,7 +190,7 @@ Kết quả API phải có:
 {"ok":true,"service":"moc-tam-ai-api","version":"2.1.0"}
 ```
 
-## 6. Cấu hình OpenAI
+## 7. Cấu hình OpenAI
 
 Đăng nhập Super Admin → **OpenAI** và cấu hình:
 
@@ -172,7 +205,7 @@ Kết quả API phải có:
 
 Giá token OpenAI trong dashboard chỉ dùng để theo dõi chi phí thật và biên lợi nhuận. Khách hàng mua gói dịch vụ theo AI Unit, không mua token hoặc số dư tiền.
 
-## 7. Luồng mua dịch vụ
+## 8. Luồng mua dịch vụ
 
 Giai đoạn đầu:
 
@@ -189,7 +222,7 @@ Khi mua gói thuê bao mới, gói đang hoạt động được kết thúc và
 
 Sau này có thể tích hợp payOS/VNPay/VietQR để xác nhận đơn tự động. Payment webhook phải kiểm tra chữ ký và idempotency trước khi tự kích hoạt dịch vụ.
 
-## 8. Quản trị khách hàng
+## 9. Quản trị khách hàng
 
 Super Admin có thể:
 
@@ -202,7 +235,7 @@ Super Admin có thể:
 - xem doanh thu đơn đã duyệt;
 - xem chi phí OpenAI thực tế và số AI Unit đã sử dụng.
 
-## 9. Facebook OAuth
+## 10. Facebook OAuth
 
 User vào **Fanpage → Kết nối với Facebook**. Production cần public HTTPS:
 
@@ -213,7 +246,7 @@ https://ai.tenmiencuaban.com/webhook
 
 Meta App cần các quyền Page/Messenger phù hợp và có thể cần App Review / Advanced Access trước khi khách hàng ngoài vai trò App sử dụng.
 
-## 10. Trước khi bán rộng rãi
+## 11. Trước khi bán rộng rãi
 
 Cần hoàn thiện thêm: domain + HTTPS reverse proxy, backup PostgreSQL tự động, email verification/password reset, rate limit qua Redis, audit log quản trị, payment webhook có chữ ký, monitoring, chính sách hoàn tiền, điều khoản sử dụng và chính sách bảo vệ dữ liệu.
 
