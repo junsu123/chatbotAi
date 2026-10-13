@@ -2,7 +2,15 @@ const { Worker } = require('bullmq');
 const OpenAI = require('openai');
 const { db, connection } = require('./common');
 const { decryptSecret } = require('./security');
-const { getOpenAiConfig, calculateCharge, calculateReserve, reserveCredits, refundCredits, settleCredits } = require('./billing');
+const {
+  getOpenAiConfig,
+  calculateRealCost,
+  calculateUnits,
+  calculateReserveUnits,
+  reserveUnits,
+  releaseUnits,
+  settleUnits,
+} = require('./billing');
 
 function selectProducts(products, question) {
   const terms = String(question || '').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(x => x.length >= 2);
@@ -11,8 +19,8 @@ function selectProducts(products, question) {
     const score = terms.reduce((n, t) => n + (hay.includes(t) ? 1 : 0), 0);
     return { p, score };
   }).sort((a, b) => b.score - a.score);
-  const selected = scored.filter(x => x.score > 0).slice(0, 8);
-  return (selected.length ? selected : scored.slice(0, 6)).map(x => x.p);
+  const selected = scored.filter(x => x.score > 0).slice(0, 6);
+  return (selected.length ? selected : scored.slice(0, 5)).map(x => x.p);
 }
 
 async function systemMessage(conversationId, body) {
@@ -20,7 +28,7 @@ async function systemMessage(conversationId, body) {
 }
 
 async function handle({ pageId, senderId, mid, text, demo }) {
-  const page = await db.page.findUnique({ where: { pageId }, include: { products: true, owner: { include: { wallet: true } } } });
+  const page = await db.page.findUnique({ where: { pageId }, include: { products: true, owner: true } });
   if (!page) { console.warn('Page not found', pageId); return; }
   if (!page.owner) { console.warn('Page has no owner', pageId); return; }
 
@@ -46,28 +54,48 @@ async function handle({ pageId, senderId, mid, text, demo }) {
     return;
   }
 
-  const history = await db.message.findMany({ where: { conversationId: conversation.id, direction: { in: ['incoming', 'outgoing', 'demo'] } }, orderBy: { createdAt: 'desc' }, take: 10 });
+  const history = await db.message.findMany({
+    where: { conversationId: conversation.id, direction: { in: ['incoming', 'outgoing', 'demo'] } },
+    orderBy: { createdAt: 'desc' },
+    take: 8,
+  });
   const products = selectProducts(page.products, text);
-  const catalog = products.map(p => `${p.name}: ${p.description}; giá ${p.price == null ? 'chưa có' : p.price + ' VND'}`).join('\n');
-  const systemPrompt = `${page.prompt}\nChỉ sử dụng thông tin đã được xác minh. Không bịa giá, tác dụng chữa bệnh hay cam kết giao hàng. Nếu không rõ hãy đề nghị chuyển nhân viên. Trả lời ngắn gọn, phù hợp Messenger.\nSản phẩm liên quan:\n${catalog || '(chưa có dữ liệu)'}`;
+  const catalog = products.map(p => `${p.name}: ${String(p.description || '').slice(0, 1200)}; giá ${p.price == null ? 'chưa có' : p.price + ' VND'}`).join('\n');
+  const systemPrompt = `${String(page.prompt || '').slice(0, 6000)}\nChỉ sử dụng thông tin đã được xác minh. Không bịa giá, tác dụng chữa bệnh hay cam kết giao hàng. Nếu không rõ hãy đề nghị chuyển nhân viên. Trả lời ngắn gọn, phù hợp Messenger.\nSản phẩm liên quan:\n${catalog || '(chưa có dữ liệu)'}`;
   const messages = [
     { role: 'system', content: systemPrompt },
-    ...history.reverse().map(m => ({ role: m.direction === 'incoming' ? 'user' : 'assistant', content: m.body })),
+    ...history.reverse().map(m => ({ role: m.direction === 'incoming' ? 'user' : 'assistant', content: String(m.body || '').slice(0, 1600) })),
   ];
   const promptText = messages.map(m => `${m.role}:${m.content}`).join('\n');
-  const reserve = calculateReserve(cfg, promptText);
+  const estimatedUnits = calculateReserveUnits(cfg, promptText);
+  const isAdmin = page.owner.role === 'SUPER_ADMIN';
 
   const usage = await db.aiUsage.create({
-    data: { requestId: String(mid), userId: page.ownerId, pageId: page.id, conversationId: conversation.id, model: cfg.model, reservedCredits: reserve, status: 'RESERVED' },
+    data: {
+      requestId: String(mid),
+      userId: page.ownerId,
+      pageId: page.id,
+      conversationId: conversation.id,
+      model: cfg.model,
+      reservedUnits: isAdmin ? 0 : estimatedUnits,
+      status: 'RESERVED',
+    },
   });
 
-  try {
-    await reserveCredits(page.ownerId, reserve, `ai:${usage.id}:reserve`, `Tạm giữ cho AI - ${page.name}`);
-  } catch (e) {
-    await db.aiUsage.update({ where: { id: usage.id }, data: { status: 'FAILED', error: e.code === 'INSUFFICIENT_CREDIT' ? 'INSUFFICIENT_CREDIT' : e.message, completedAt: new Date() } });
-    if (e.code === 'INSUFFICIENT_CREDIT') await systemMessage(conversation.id, 'AI tạm dừng: tài khoản không đủ tín dụng.');
-    else console.error('Reserve credits failed:', e);
-    return;
+  let subscriptionId = null;
+  if (!isAdmin) {
+    try {
+      const sub = await reserveUnits(page.ownerId, estimatedUnits, `ai:${usage.id}:reserve`, `Tạm giữ AI Unit - ${page.name}`);
+      subscriptionId = sub.id;
+      await db.aiUsage.update({ where: { id: usage.id }, data: { subscriptionId } });
+    } catch (e) {
+      const reason = e.code === 'NO_ACTIVE_SUBSCRIPTION' ? 'NO_ACTIVE_SUBSCRIPTION' : e.code === 'INSUFFICIENT_QUOTA' ? 'INSUFFICIENT_QUOTA' : String(e.message || e);
+      await db.aiUsage.update({ where: { id: usage.id }, data: { status: 'FAILED', error: reason, completedAt: new Date() } });
+      if (e.code === 'NO_ACTIVE_SUBSCRIPTION') await systemMessage(conversation.id, 'AI tạm dừng: tài khoản chưa có gói dịch vụ đang hoạt động.');
+      else if (e.code === 'INSUFFICIENT_QUOTA') await systemMessage(conversation.id, 'AI tạm dừng: gói dịch vụ đã hết lượt AI. Vui lòng mua add-on hoặc gia hạn gói.');
+      else console.error('Reserve quota failed:', e);
+      return;
+    }
   }
 
   let reply, inputTokens = 0, outputTokens = 0;
@@ -78,17 +106,32 @@ async function handle({ pageId, senderId, mid, text, demo }) {
     inputTokens = Number(response.usage?.prompt_tokens || 0);
     outputTokens = Number(response.usage?.completion_tokens || 0);
   } catch (e) {
-    await refundCredits(page.ownerId, reserve, `ai:${usage.id}:fail-refund`, 'Hoàn tín dụng do OpenAI lỗi').catch(err => console.error('Refund failed:', err));
+    if (!isAdmin && subscriptionId) {
+      await releaseUnits(page.ownerId, subscriptionId, estimatedUnits, `ai:${usage.id}:fail-release`, 'Hoàn AI Unit do OpenAI lỗi').catch(err => console.error('Quota release failed:', err));
+    }
     await db.aiUsage.update({ where: { id: usage.id }, data: { status: 'FAILED', error: String(e.message || e).slice(0, 500), completedAt: new Date() } });
-    await systemMessage(conversation.id, 'AI gặp lỗi khi tạo câu trả lời; tín dụng đã được hoàn lại.');
+    await systemMessage(conversation.id, 'AI gặp lỗi khi tạo câu trả lời; lượt AI tạm giữ đã được hoàn lại.');
     return;
   }
 
-  const priced = calculateCharge(cfg, inputTokens, outputTokens);
-  const settled = await settleCredits(page.ownerId, reserve, priced.retailCredits, `ai:${usage.id}`, `AI ${cfg.model} - ${page.name}`);
+  const realCostVnd = calculateRealCost(cfg, inputTokens, outputTokens);
+  const finalUnits = calculateUnits(cfg, inputTokens, outputTokens);
+  let charged = 0, shortfall = 0;
+  if (!isAdmin) {
+    const settled = await settleUnits(page.ownerId, subscriptionId, estimatedUnits, finalUnits, `ai:${usage.id}`, `AI ${cfg.model} - ${page.name}`);
+    charged = settled.charged;
+    shortfall = settled.shortfall;
+  }
+
   await db.aiUsage.update({
     where: { id: usage.id },
-    data: { inputTokens, outputTokens, realCostVnd: priced.realCostVnd, retailCredits: settled.charged, error: settled.shortfall ? `Billing shortfall ${settled.shortfall} credits` : null },
+    data: {
+      inputTokens,
+      outputTokens,
+      realCostVnd,
+      unitsCharged: charged,
+      error: shortfall ? `Quota shortfall ${shortfall} unit(s)` : null,
+    },
   });
 
   const current = await db.conversation.findUnique({ where: { id: conversation.id } });
@@ -113,12 +156,17 @@ async function handle({ pageId, senderId, mid, text, demo }) {
   }
 
   const url = `https://graph.facebook.com/${process.env.META_GRAPH_VERSION || 'v23.0'}/me/messages`;
-  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${pageToken}` }, body: JSON.stringify({ recipient: { id: senderId }, messaging_type: 'RESPONSE', message: { text: reply } }) });
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${pageToken}` },
+    body: JSON.stringify({ recipient: { id: senderId }, messaging_type: 'RESPONSE', message: { text: reply } }),
+  });
   if (!response.ok) {
     const err = `Meta send error ${response.status}: ${(await response.text()).slice(0, 300)}`;
     await db.message.create({ data: { conversationId: conversation.id, direction: 'failed', body: reply } });
     await db.aiUsage.update({ where: { id: usage.id }, data: { status: 'DELIVERY_FAILED', error: err, completedAt: new Date() } });
-    console.error(err); return;
+    console.error(err);
+    return;
   }
 
   await db.message.create({ data: { conversationId: conversation.id, direction: 'outgoing', body: reply } });
@@ -128,4 +176,4 @@ async function handle({ pageId, senderId, mid, text, demo }) {
 const worker = new Worker('messages', async job => handle(job.data), { connection, concurrency: 4 });
 worker.on('completed', j => console.log('Processed', j.id));
 worker.on('failed', (j, e) => console.error('Worker failed', j?.id, e.message));
-console.log('Mộc Tâm AI V2.0 worker ready');
+console.log('Mộc Tâm AI V2.1 worker ready');
