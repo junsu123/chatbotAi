@@ -6,7 +6,10 @@ const {
   SESSION_COOKIE, normalizeEmail, hashPassword, verifyPassword, encryptSecret,
   newSessionToken, hashSessionToken, parseCookies, setSessionCookie, clearSessionCookie,
 } = require('./security');
-const { ensureDefaultSettings, getSettings, getOpenAiConfig, ensureWallet, adjustCredits } = require('./billing');
+const {
+  ensureDefaultSettings, getSettings, getOpenAiConfig, quotaView,
+  getActiveSubscription, adjustQuota, approveServiceOrder,
+} = require('./billing');
 
 const app = express();
 app.disable('x-powered-by');
@@ -33,10 +36,7 @@ async function auth(req, res, next) {
   try {
     const token = parseCookies(req.headers.cookie)[SESSION_COOKIE];
     if (!token) return res.status(401).json({ error: 'Bạn chưa đăng nhập' });
-    const session = await db.session.findUnique({
-      where: { tokenHash: hashSessionToken(token) },
-      include: { user: { include: { wallet: true } } },
-    });
+    const session = await db.session.findUnique({ where: { tokenHash: hashSessionToken(token) }, include: { user: true } });
     if (!session || session.expiresAt <= new Date() || session.user.status !== 'ACTIVE') {
       if (session) await db.session.delete({ where: { id: session.id } }).catch(() => {});
       clearSessionCookie(res);
@@ -55,7 +55,7 @@ function superAdmin(req, res, next) {
 }
 
 function publicUser(user) {
-  return { id: user.id, email: user.email, name: user.name, role: user.role, status: user.status, wallet: user.wallet || null };
+  return { id: user.id, email: user.email, name: user.name, role: user.role, status: user.status };
 }
 
 async function createSession(res, userId) {
@@ -147,7 +147,13 @@ function tenantWhere(user) { return user.role === 'SUPER_ADMIN' ? {} : { ownerId
 function conversationWhere(user) { return user.role === 'SUPER_ADMIN' ? {} : { page: { ownerId: user.id } }; }
 function productWhere(user) { return user.role === 'SUPER_ADMIN' ? {} : { page: { ownerId: user.id } }; }
 
-app.get('/health', (req, res) => res.json({ ok: true, service: 'moc-tam-ai-api', version: '2.0.0' }));
+async function serviceSnapshot(user) {
+  if (user.role === 'SUPER_ADMIN') return { unlimited: true, subscription: null, quota: { totalUnits: 0, usedUnits: 0, reservedUnits: 0, availableUnits: 0 } };
+  const subscription = await getActiveSubscription(user.id);
+  return { unlimited: false, subscription, quota: quotaView(subscription) };
+}
+
+app.get('/health', (req, res) => res.json({ ok: true, service: 'moc-tam-ai-api', version: '2.1.0' }));
 
 app.get('/webhook', (req, res) => {
   const q = req.query;
@@ -177,19 +183,14 @@ app.post('/auth/register', wrap(async (req, res) => {
   if (!/^\S+@\S+\.\S+$/.test(email) || !name) return res.status(400).json({ error: 'Tên hoặc email không hợp lệ' });
   if (await db.user.findUnique({ where: { email } })) return res.status(409).json({ error: 'Email đã được sử dụng' });
   const passwordHash = await hashPassword(req.body.password);
-  const bonus = Math.max(0, Math.trunc(Number(settings.signup_bonus || 0)));
-  const user = await db.$transaction(async tx => {
-    const u = await tx.user.create({ data: { email, name, passwordHash, wallet: { create: { balance: bonus } } }, include: { wallet: true } });
-    if (bonus) await tx.creditTransaction.create({ data: { userId: u.id, type: 'SIGNUP_BONUS', amount: bonus, balanceAfter: bonus, description: 'Tín dụng tặng khi đăng ký' } });
-    return u;
-  });
+  const user = await db.user.create({ data: { email, name, passwordHash } });
   await createSession(res, user.id);
   res.json({ user: publicUser(user) });
 }));
 
 app.post('/auth/login', wrap(async (req, res) => {
   const email = normalizeEmail(req.body.email);
-  const user = await db.user.findUnique({ where: { email }, include: { wallet: true } });
+  const user = await db.user.findUnique({ where: { email } });
   if (!user || !(await verifyPassword(req.body.password, user.passwordHash))) return res.status(401).json({ error: 'Email hoặc mật khẩu không đúng' });
   if (user.status !== 'ACTIVE') return res.status(403).json({ error: 'Tài khoản đang bị khóa' });
   await createSession(res, user.id);
@@ -202,7 +203,6 @@ app.post('/auth/logout', async (req, res) => {
   clearSessionCookie(res);
   res.json({ ok: true });
 });
-
 app.get('/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
 
 app.get('/auth/facebook/callback', async (req, res) => {
@@ -236,17 +236,16 @@ app.get('/auth/facebook/callback', async (req, res) => {
 app.use('/api', auth);
 
 app.get('/api/dashboard', wrap(async (req, res) => {
-  const pageWhere = tenantWhere(req.user);
   const usageWhere = req.user.role === 'SUPER_ADMIN' ? {} : { userId: req.user.id };
-  const [pages, conversations, messages, usage, wallet, users] = await Promise.all([
-    db.page.count({ where: pageWhere }),
+  const [pages, conversations, messages, usage, service, users] = await Promise.all([
+    db.page.count({ where: tenantWhere(req.user) }),
     db.conversation.count({ where: conversationWhere(req.user) }),
     db.message.count({ where: req.user.role === 'SUPER_ADMIN' ? {} : { conversation: { page: { ownerId: req.user.id } } } }),
-    db.aiUsage.aggregate({ where: usageWhere, _sum: { retailCredits: true, realCostVnd: true }, _count: true }),
-    ensureWallet(req.user.id),
+    db.aiUsage.aggregate({ where: usageWhere, _sum: { unitsCharged: true, realCostVnd: true }, _count: true }),
+    serviceSnapshot(req.user),
     req.user.role === 'SUPER_ADMIN' ? db.user.count() : Promise.resolve(undefined),
   ]);
-  res.json({ pages, conversations, messages, aiRequests: usage._count, creditsUsed: usage._sum.retailCredits || 0, aiCostVnd: usage._sum.realCostVnd || 0, wallet, users });
+  res.json({ pages, conversations, messages, aiRequests: usage._count, unitsUsed: usage._sum.unitsCharged || 0, aiCostVnd: usage._sum.realCostVnd || 0, service, users });
 }));
 
 app.get('/api/facebook/login-url', (req, res) => {
@@ -267,14 +266,21 @@ app.post('/api/pages', wrap(async (req, res) => {
   if (!pageId || !name) return res.status(400).json({ error: 'Thiếu Page ID hoặc tên' });
   const existing = await db.page.findUnique({ where: { pageId } });
   if (existing?.ownerId && existing.ownerId !== req.user.id && req.user.role !== 'SUPER_ADMIN') return res.status(409).json({ error: 'Page này đã thuộc tài khoản khác' });
-  const ownerId = req.user.id;
-  const row = existing ? await db.page.update({ where: { id: existing.id }, data: { ownerId, name } }) : await db.page.create({ data: { pageId, name, ownerId } });
+  const row = existing ? await db.page.update({ where: { id: existing.id }, data: { ownerId: req.user.id, name } }) : await db.page.create({ data: { pageId, name, ownerId: req.user.id } });
   res.json({ id: row.id, pageId: row.pageId, name: row.name, enabled: row.enabled });
 }));
 app.patch('/api/pages/:id', wrap(async (req, res) => {
   const page = await ownedPage(req.params.id, req.user); if (!page) return res.status(404).json({ error: 'Không tìm thấy Page' });
   const data = {};
-  if (typeof req.body.enabled === 'boolean') data.enabled = req.body.enabled;
+  if (typeof req.body.enabled === 'boolean') {
+    if (req.body.enabled && !page.enabled && req.user.role !== 'SUPER_ADMIN') {
+      const sub = await getActiveSubscription(req.user.id);
+      if (!sub) return res.status(403).json({ error: 'Cần mua gói dịch vụ trước khi bật AI' });
+      const enabledCount = await db.page.count({ where: { ownerId: req.user.id, enabled: true, id: { not: page.id } } });
+      if (enabledCount >= sub.maxPages) return res.status(403).json({ error: `Gói ${sub.planName} chỉ cho phép ${sub.maxPages} Fanpage bật AI` });
+    }
+    data.enabled = req.body.enabled;
+  }
   if (typeof req.body.prompt === 'string') data.prompt = req.body.prompt.slice(0, 12000);
   if (typeof req.body.token === 'string' && req.body.token.trim()) { data.tokenEncrypted = encryptSecret(req.body.token.trim()); data.token = null; }
   const row = await db.page.update({ where: { id: page.id }, data });
@@ -294,7 +300,7 @@ app.patch('/api/conversations/:id', wrap(async (req, res) => {
   res.json(await db.conversation.update({ where: { id: c.id }, data }));
 }));
 
-app.get('/api/products', wrap(async (req, res) => res.json(await db.product.findMany({ where: productWhere(req.user), include: { page: { select: { name: true } }, }, orderBy: { name: 'asc' } }))));
+app.get('/api/products', wrap(async (req, res) => res.json(await db.product.findMany({ where: productWhere(req.user), include: { page: { select: { name: true } } }, orderBy: { name: 'asc' } }))));
 app.post('/api/products', wrap(async (req, res) => {
   const page = await ownedPage(String(req.body.pageId || ''), req.user); if (!page) return res.status(404).json({ error: 'Page không hợp lệ' });
   const name = String(req.body.name || '').trim(); if (!name) return res.status(400).json({ error: 'Thiếu tên sản phẩm' });
@@ -306,77 +312,115 @@ app.post('/api/demo', wrap(async (req, res) => {
   const page = await db.page.findUnique({ where: { pageId: String(req.body.pageId || '') } });
   if (!page || (req.user.role !== 'SUPER_ADMIN' && page.ownerId !== req.user.id)) return res.status(404).json({ error: 'Page không hợp lệ' });
   const text = String(req.body.text || '').trim(); if (!text) return res.status(400).json({ error: 'Thiếu nội dung' });
-  const mid = 'demo-' + crypto.randomUUID(); await queue.add('incoming', { pageId: page.pageId, senderId: 'demo-customer', mid, text, demo: true }, { attempts: 1 }); res.json({ queued: true, mid });
+  const mid = 'demo-' + crypto.randomUUID();
+  await queue.add('incoming', { pageId: page.pageId, senderId: 'demo-customer', mid, text, demo: true }, { attempts: 1 });
+  res.json({ queued: true, mid });
 }));
 
-app.get('/api/wallet', wrap(async (req, res) => {
-  const wallet = await ensureWallet(req.user.id);
-  const transactions = await db.creditTransaction.findMany({ where: { userId: req.user.id }, orderBy: { createdAt: 'desc' }, take: 100 });
-  res.json({ wallet, transactions });
+app.get('/api/service', wrap(async (req, res) => {
+  const [service, plans, orders, transactions] = await Promise.all([
+    serviceSnapshot(req.user),
+    db.servicePlan.findMany({ where: { active: true }, orderBy: [{ type: 'asc' }, { sortOrder: 'asc' }, { priceVnd: 'asc' }] }),
+    db.serviceOrder.findMany({ where: { userId: req.user.id }, include: { plan: true }, orderBy: { createdAt: 'desc' }, take: 50 }),
+    db.quotaTransaction.findMany({ where: { userId: req.user.id }, orderBy: { createdAt: 'desc' }, take: 100 }),
+  ]);
+  res.json({ ...service, plans, orders, transactions });
 }));
-app.get('/api/packages', wrap(async (req, res) => res.json(await db.topupPackage.findMany({ where: { active: true }, orderBy: [{ sortOrder: 'asc' }, { priceVnd: 'asc' }] }))));
-app.get('/api/topup-orders', wrap(async (req, res) => res.json(await db.topupOrder.findMany({ where: { userId: req.user.id }, include: { package: true }, orderBy: { createdAt: 'desc' }, take: 50 }))));
-app.post('/api/topup-orders', wrap(async (req, res) => {
-  const pack = await db.topupPackage.findUnique({ where: { id: String(req.body.packageId || '') } });
-  if (!pack || !pack.active) return res.status(404).json({ error: 'Gói tín dụng không tồn tại' });
+app.post('/api/service-orders', wrap(async (req, res) => {
+  const plan = await db.servicePlan.findUnique({ where: { id: String(req.body.planId || '') } });
+  if (!plan || !plan.active) return res.status(404).json({ error: 'Gói dịch vụ không tồn tại' });
+  if (plan.type === 'ADDON' && req.user.role !== 'SUPER_ADMIN' && !(await getActiveSubscription(req.user.id))) return res.status(400).json({ error: 'Cần có gói thuê bao đang hoạt động trước khi mua add-on' });
   const paymentCode = `MT${Date.now().toString(36).toUpperCase()}${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
-  res.json(await db.topupOrder.create({ data: { userId: req.user.id, packageId: pack.id, amountVnd: pack.priceVnd, credits: pack.credits, paymentCode } }));
+  res.json(await db.serviceOrder.create({ data: { userId: req.user.id, planId: plan.id, planName: plan.name, planType: plan.type, amountVnd: plan.priceVnd, units: plan.units, durationDays: plan.durationDays, maxPages: plan.maxPages, paymentCode } }));
 }));
 
 app.use('/api/admin', superAdmin);
 
 app.get('/api/admin/overview', wrap(async (req, res) => {
-  const [users, pages, orders, wallets, usage] = await Promise.all([
-    db.user.count(), db.page.count(), db.topupOrder.count({ where: { status: 'PENDING' } }), db.wallet.aggregate({ _sum: { balance: true, reserved: true } }), db.aiUsage.aggregate({ _sum: { retailCredits: true, realCostVnd: true }, _count: true }),
+  const [users, pages, pendingOrders, activeSubscriptions, revenue, usage] = await Promise.all([
+    db.user.count(),
+    db.page.count(),
+    db.serviceOrder.count({ where: { status: 'PENDING' } }),
+    db.subscription.count({ where: { status: 'ACTIVE', expiresAt: { gt: new Date() } } }),
+    db.serviceOrder.aggregate({ where: { status: 'PAID' }, _sum: { amountVnd: true } }),
+    db.aiUsage.aggregate({ _sum: { unitsCharged: true, realCostVnd: true }, _count: true }),
   ]);
-  res.json({ users, pages, pendingOrders: orders, creditsInWallets: wallets._sum.balance || 0, creditsReserved: wallets._sum.reserved || 0, aiRequests: usage._count, creditsCharged: usage._sum.retailCredits || 0, realAiCostVnd: usage._sum.realCostVnd || 0 });
+  res.json({ users, pages, pendingOrders, activeSubscriptions, revenueVnd: revenue._sum.amountVnd || 0, aiRequests: usage._count, unitsConsumed: usage._sum.unitsCharged || 0, realAiCostVnd: usage._sum.realCostVnd || 0 });
 }));
-app.get('/api/admin/users', wrap(async (req, res) => res.json(await db.user.findMany({ select: { id: true, email: true, name: true, role: true, status: true, createdAt: true, wallet: true, _count: { select: { pages: true, aiUsages: true } } }, orderBy: { createdAt: 'desc' }, take: 500 }))));
+app.get('/api/admin/users', wrap(async (req, res) => res.json(await db.user.findMany({
+  select: {
+    id: true, email: true, name: true, role: true, status: true, createdAt: true,
+    subscriptions: { where: { status: 'ACTIVE', expiresAt: { gt: new Date() } }, orderBy: { startedAt: 'desc' }, take: 1 },
+    _count: { select: { pages: true, aiUsages: true } },
+  },
+  orderBy: { createdAt: 'desc' }, take: 500,
+}))));
 app.patch('/api/admin/users/:id', wrap(async (req, res) => {
   if (req.params.id === req.user.id && req.body.status === 'SUSPENDED') return res.status(400).json({ error: 'Không thể tự khóa tài khoản Super Admin đang đăng nhập' });
   const data = {}; if (['ACTIVE', 'SUSPENDED'].includes(req.body.status)) data.status = req.body.status;
   res.json(await db.user.update({ where: { id: req.params.id }, data, select: { id: true, email: true, status: true, role: true } }));
 }));
-app.post('/api/admin/users/:id/credits', wrap(async (req, res) => {
-  const amount = Math.trunc(Number(req.body.amount)); if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: 'Số credit không hợp lệ' });
+app.post('/api/admin/users/:id/quota', wrap(async (req, res) => {
+  const amount = Math.trunc(Number(req.body.amount));
   const target = await db.user.findUnique({ where: { id: req.params.id } }); if (!target) return res.status(404).json({ error: 'Không tìm thấy user' });
-  const wallet = await adjustCredits(target.id, amount, 'ADMIN_ADJUST', `admin:${crypto.randomUUID()}`, String(req.body.description || `Điều chỉnh bởi ${req.user.email}`).slice(0, 250));
-  res.json(wallet);
+  const sub = await adjustQuota(target.id, amount, `admin:${crypto.randomUUID()}`, String(req.body.description || `Điều chỉnh bởi ${req.user.email}`).slice(0, 250));
+  res.json({ subscription: sub, quota: quotaView(sub) });
+}));
+app.post('/api/admin/users/:id/grant-plan', wrap(async (req, res) => {
+  const target = await db.user.findUnique({ where: { id: req.params.id } }); if (!target) return res.status(404).json({ error: 'Không tìm thấy user' });
+  const plan = await db.servicePlan.findUnique({ where: { id: String(req.body.planId || '') } });
+  if (!plan || plan.type !== 'SUBSCRIPTION') return res.status(400).json({ error: 'Chỉ có thể gán gói thuê bao' });
+  const order = await db.serviceOrder.create({ data: { userId: target.id, planId: plan.id, planName: plan.name, planType: plan.type, amountVnd: 0, units: plan.units, durationDays: plan.durationDays, maxPages: plan.maxPages, provider: 'ADMIN', paymentCode: `ADM${Date.now().toString(36).toUpperCase()}${crypto.randomBytes(3).toString('hex').toUpperCase()}` } });
+  res.json(await approveServiceOrder(order.id));
 }));
 
-app.get('/api/admin/topup-orders', wrap(async (req, res) => res.json(await db.topupOrder.findMany({ include: { user: { select: { email: true, name: true } }, package: true }, orderBy: { createdAt: 'desc' }, take: 200 }))));
-app.post('/api/admin/topup-orders/:id/approve', wrap(async (req, res) => {
-  const result = await db.$transaction(async tx => {
-    const order = await tx.topupOrder.findUnique({ where: { id: req.params.id } }); if (!order) throw new Error('Không tìm thấy yêu cầu nạp');
-    if (order.status === 'PAID') return order;
-    if (order.status !== 'PENDING') throw new Error('Yêu cầu không còn ở trạng thái chờ');
-    const changed = await tx.topupOrder.updateMany({ where: { id: order.id, status: 'PENDING' }, data: { status: 'PAID', paidAt: new Date() } });
-    if (changed.count !== 1) throw new Error('Yêu cầu đã được xử lý');
-    await tx.wallet.upsert({ where: { userId: order.userId }, create: { userId: order.userId }, update: {} });
-    const wallet = await tx.wallet.update({ where: { userId: order.userId }, data: { balance: { increment: order.credits } } });
-    await tx.creditTransaction.create({ data: { userId: order.userId, type: 'TOPUP', amount: order.credits, balanceAfter: wallet.balance, reservedAfter: wallet.reserved, reference: `topup:${order.id}`, description: `Nạp ${order.amountVnd.toLocaleString('vi-VN')}đ - ${order.paymentCode}` } });
-    return tx.topupOrder.findUnique({ where: { id: order.id } });
-  });
-  res.json(result);
+app.get('/api/admin/service-orders', wrap(async (req, res) => res.json(await db.serviceOrder.findMany({ include: { user: { select: { email: true, name: true } }, plan: true, subscription: true }, orderBy: { createdAt: 'desc' }, take: 200 }))));
+app.post('/api/admin/service-orders/:id/approve', wrap(async (req, res) => res.json(await approveServiceOrder(req.params.id))));
+app.post('/api/admin/service-orders/:id/cancel', wrap(async (req, res) => {
+  const order = await db.serviceOrder.findUnique({ where: { id: req.params.id } });
+  if (!order) return res.status(404).json({ error: 'Không tìm thấy đơn' });
+  if (order.status !== 'PENDING') return res.status(400).json({ error: 'Chỉ có thể hủy đơn đang chờ' });
+  res.json(await db.serviceOrder.update({ where: { id: order.id }, data: { status: 'CANCELLED' } }));
 }));
-app.post('/api/admin/topup-orders/:id/cancel', wrap(async (req, res) => res.json(await db.topupOrder.update({ where: { id: req.params.id }, data: { status: 'CANCELLED' } }))));
 
-app.get('/api/admin/packages', wrap(async (req, res) => res.json(await db.topupPackage.findMany({ orderBy: [{ sortOrder: 'asc' }, { priceVnd: 'asc' }] }))));
-app.post('/api/admin/packages', wrap(async (req, res) => {
-  const name = String(req.body.name || '').trim(); const priceVnd = Math.trunc(Number(req.body.priceVnd)); const credits = Math.trunc(Number(req.body.credits));
-  if (!name || priceVnd <= 0 || credits <= 0) return res.status(400).json({ error: 'Gói tín dụng không hợp lệ' });
-  res.json(await db.topupPackage.create({ data: { name, priceVnd, credits, sortOrder: Math.trunc(Number(req.body.sortOrder || 0)) } }));
+app.get('/api/admin/plans', wrap(async (req, res) => res.json(await db.servicePlan.findMany({ orderBy: [{ type: 'asc' }, { sortOrder: 'asc' }, { priceVnd: 'asc' }] }))));
+app.post('/api/admin/plans', wrap(async (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const type = ['SUBSCRIPTION', 'ADDON'].includes(req.body.type) ? req.body.type : 'SUBSCRIPTION';
+  const priceVnd = Math.trunc(Number(req.body.priceVnd));
+  const units = Math.trunc(Number(req.body.units));
+  const durationDays = type === 'SUBSCRIPTION' ? Math.max(1, Math.trunc(Number(req.body.durationDays || 30))) : 0;
+  const maxPages = type === 'SUBSCRIPTION' ? Math.max(1, Math.trunc(Number(req.body.maxPages || 1))) : 0;
+  if (!name || priceVnd < 0 || units <= 0) return res.status(400).json({ error: 'Gói dịch vụ không hợp lệ' });
+  res.json(await db.servicePlan.create({ data: { name, type, priceVnd, units, durationDays, maxPages, sortOrder: Math.trunc(Number(req.body.sortOrder || 0)) } }));
 }));
-app.patch('/api/admin/packages/:id', wrap(async (req, res) => {
-  const data = {}; if (typeof req.body.active === 'boolean') data.active = req.body.active; if (req.body.name) data.name = String(req.body.name).trim();
-  if (req.body.priceVnd != null) data.priceVnd = Math.trunc(Number(req.body.priceVnd)); if (req.body.credits != null) data.credits = Math.trunc(Number(req.body.credits));
-  res.json(await db.topupPackage.update({ where: { id: req.params.id }, data }));
+app.patch('/api/admin/plans/:id', wrap(async (req, res) => {
+  const data = {};
+  if (typeof req.body.active === 'boolean') data.active = req.body.active;
+  if (req.body.name) data.name = String(req.body.name).trim();
+  if (req.body.priceVnd != null) data.priceVnd = Math.max(0, Math.trunc(Number(req.body.priceVnd)));
+  if (req.body.units != null) data.units = Math.max(1, Math.trunc(Number(req.body.units)));
+  if (req.body.durationDays != null) data.durationDays = Math.max(0, Math.trunc(Number(req.body.durationDays)));
+  if (req.body.maxPages != null) data.maxPages = Math.max(0, Math.trunc(Number(req.body.maxPages)));
+  res.json(await db.servicePlan.update({ where: { id: req.params.id }, data }));
 }));
 
 app.get('/api/admin/openai', wrap(async (req, res) => {
-  const settings = await getSettings(); const secret = await db.systemSetting.findUnique({ where: { key: 'openai_api_key' } });
-  let keyHint = ''; if (secret?.encryptedValue) { try { const k = (await getOpenAiConfig()).apiKey; keyHint = k ? `••••${k.slice(-4)}` : ''; } catch { keyHint = 'đã mã hóa'; } }
-  res.json({ keyConfigured: !!secret?.encryptedValue, keyHint, model: settings.openai_model, inputUsdPerMillion: Number(settings.openai_input_usd_per_million), outputUsdPerMillion: Number(settings.openai_output_usd_per_million), usdToVnd: Number(settings.usd_to_vnd), markup: Number(settings.ai_markup), minCredits: Number(settings.ai_min_credits), maxOutputTokens: Number(settings.ai_max_output_tokens) });
+  const settings = await getSettings();
+  const secret = await db.systemSetting.findUnique({ where: { key: 'openai_api_key' } });
+  let keyHint = '';
+  if (secret?.encryptedValue) { try { const k = (await getOpenAiConfig()).apiKey; keyHint = k ? `••••${k.slice(-4)}` : ''; } catch { keyHint = 'đã mã hóa'; } }
+  res.json({
+    keyConfigured: !!secret?.encryptedValue,
+    keyHint,
+    model: settings.openai_model,
+    inputUsdPerMillion: Number(settings.openai_input_usd_per_million),
+    outputUsdPerMillion: Number(settings.openai_output_usd_per_million),
+    usdToVnd: Number(settings.usd_to_vnd),
+    maxOutputTokens: Number(settings.ai_max_output_tokens),
+    tokensPerUnit: Number(settings.ai_tokens_per_unit),
+    maxUnitsPerReply: Number(settings.ai_max_units_per_reply),
+  });
 }));
 app.put('/api/admin/openai', wrap(async (req, res) => {
   const fields = {
@@ -384,9 +428,9 @@ app.put('/api/admin/openai', wrap(async (req, res) => {
     openai_input_usd_per_million: req.body.inputUsdPerMillion,
     openai_output_usd_per_million: req.body.outputUsdPerMillion,
     usd_to_vnd: req.body.usdToVnd,
-    ai_markup: req.body.markup,
-    ai_min_credits: req.body.minCredits,
     ai_max_output_tokens: req.body.maxOutputTokens,
+    ai_tokens_per_unit: req.body.tokensPerUnit,
+    ai_max_units_per_reply: req.body.maxUnitsPerReply,
   };
   for (const [key, value] of Object.entries(fields)) if (value != null && String(value).trim() !== '') await db.systemSetting.upsert({ where: { key }, create: { key, value: String(value).trim() }, update: { value: String(value).trim() } });
   if (typeof req.body.apiKey === 'string' && req.body.apiKey.trim()) await db.systemSetting.upsert({ where: { key: 'openai_api_key' }, create: { key: 'openai_api_key', encryptedValue: encryptSecret(req.body.apiKey.trim()) }, update: { encryptedValue: encryptSecret(req.body.apiKey.trim()) } });
@@ -398,4 +442,4 @@ app.post('/api/admin/openai/test', wrap(async (req, res) => {
 }));
 
 ensureDefaultSettings().catch(e => console.error('Default settings:', e.message));
-app.listen(4000, '0.0.0.0', () => console.log('Mộc Tâm AI V2.0 API listening on 4000'));
+app.listen(4000, '0.0.0.0', () => console.log('Mộc Tâm AI V2.1 API listening on 4000'));
