@@ -1,28 +1,88 @@
-# Mộc Tâm AI V2.0 Commercial
+# Mộc Tâm AI V2.1 Commercial
 
-Nền tảng SaaS Facebook Messenger AI cho nhiều khách hàng. V2.0 có đăng ký/đăng nhập, phân quyền `SUPER_ADMIN` / `USER`, ví tín dụng, ledger giao dịch, gói nạp, duyệt nạp thủ công, tính phí AI theo token thực tế, Facebook OAuth theo từng user và OpenAI API Key do Super Admin quản lý.
+Nền tảng SaaS Facebook Messenger AI cho nhiều khách hàng. V2.1 thay mô hình **ví / credit** của V2.0 bằng **gói thuê bao + AI Usage Quota + add-on lượt AI**.
 
-## Điểm chính V2.0
+Người dùng không có số dư tiền, không nạp tiền vào ví, không rút/chuyển tiền. Họ mua một gói dịch vụ có thời hạn và hạn mức AI Unit. Mỗi AI Unit là đơn vị quyền sử dụng dịch vụ, hết hiệu lực theo kỳ thuê bao.
 
-- Không dùng `ADMIN_KEY` để đăng nhập nữa.
-- Super Admin được tạo từ terminal bằng lệnh tương tác; mật khẩu không cần ghi vào source code.
-- Mỗi user có Wallet riêng và chỉ thấy Page / hội thoại / sản phẩm của mình.
-- Page Access Token và OpenAI API Key được mã hóa AES-256-GCM bằng `MASTER_ENCRYPTION_KEY`.
-- Worker reserve credit trước khi gọi OpenAI, sau đó settle theo token usage thực tế.
-- Hết credit thì không gọi OpenAI.
-- Super Admin có thể cộng/trừ credit, khóa user, duyệt nạp, tạo gói credit, cấu hình model / giá token / tỷ giá / markup / minimum charge.
-- Gói mặc định: 50k→50k, 100k→110k, 200k→230k, 500k→600k, 1tr→1.25tr credit.
+## Tính năng V2.1
 
-## 1. Cập nhật server
+- Đăng ký / đăng nhập bằng session HttpOnly.
+- Phân quyền `SUPER_ADMIN` / `USER`.
+- Super Admin được tạo bằng lệnh terminal, không hard-code mật khẩu.
+- Multi-tenant: mỗi user chỉ thấy Page, hội thoại và sản phẩm của mình.
+- Facebook OAuth: user đăng nhập Facebook, hệ thống tự lấy Page Access Token.
+- Page Access Token và OpenAI API Key mã hóa AES-256-GCM.
+- Gói thuê bao có: giá VND, AI Unit, số ngày, giới hạn Fanpage bật AI.
+- Add-on chỉ bổ sung AI Unit vào kỳ thuê bao đang hoạt động.
+- Worker reserve AI Unit trước khi gọi OpenAI và settle theo token usage thực tế.
+- Hết gói / hết quota thì không gọi OpenAI.
+- Super Admin không bị giới hạn quota nhưng chi phí OpenAI vẫn được ghi nhận để theo dõi.
+- Đơn dịch vụ có trạng thái `PENDING / PAID / CANCELLED`; giai đoạn đầu Super Admin xác nhận thanh toán thủ công.
+- Không triển khai chức năng rút tiền, chuyển tiền hoặc số dư tiền người dùng.
+
+## Bảng giá mặc định
+
+### Thuê bao 30 ngày
+
+| Gói | Giá | AI Unit | Fanpage bật AI |
+|---|---:|---:|---:|
+| Mini | 99.000đ | 3.000 | 1 |
+| Shop | 199.000đ | 8.000 | 3 |
+| Pro | 399.000đ | 20.000 | 10 |
+| Business | 799.000đ | 50.000 | 30 |
+
+### Add-on
+
+| Add-on | Giá | AI Unit |
+|---|---:|---:|
+| Add-on 2.000 | 59.000đ | 2.000 |
+| Add-on 5.000 | 129.000đ | 5.000 |
+| Add-on 10.000 | 229.000đ | 10.000 |
+
+Add-on hết hiệu lực cùng gói thuê bao hiện tại, không chuyển sang kỳ sau.
+
+## Cách tính AI Unit
+
+Mặc định:
+
+```text
+1 AI Unit / mỗi 2.500 token tổng (input + output)
+tối thiểu 1 AI Unit / câu trả lời
+tối đa 3 AI Unit / câu trả lời
+```
+
+Các giá trị này thay đổi được trong Dashboard Super Admin → OpenAI.
+
+Worker thực hiện:
+
+```text
+Tin Messenger
+  → kiểm tra thuê bao đang hoạt động
+  → ước lượng và reserve AI Unit
+  → gọi OpenAI
+  → đọc token usage thực tế
+  → quy đổi 1–N AI Unit
+  → settle quota + hoàn phần reserve dư
+  → ghi AiUsage + QuotaTransaction
+  → gửi trả lời Facebook
+```
+
+Super Admin được bypass quota để quản trị/test nội bộ, nhưng token usage và chi phí OpenAI vẫn được ghi nhận.
+
+## Nâng cấp từ V1 / V2.0
+
+Schema V2.1 **giữ lại các bảng Wallet/Credit của V2.0 ở dạng legacy nhưng ứng dụng không dùng hoặc hiển thị chúng nữa**, nhằm tránh `prisma db push` tự động drop dữ liệu trong lúc nâng cấp. Có thể xóa các bảng legacy bằng migration riêng sau khi đã backup và xác nhận không còn cần dữ liệu cũ.
+
+## 1. Cập nhật code
 
 ```bash
 cd ~/chatbotAi
 git pull
 ```
 
-## 2. Bổ sung cấu hình V2 vào `.env`
+## 2. Cấu hình `.env`
 
-Giữ nguyên `DATABASE_URL`, `POSTGRES_PASSWORD`, Redis và Meta hiện tại. Thêm các biến sau:
+Giữ `DATABASE_URL`, `POSTGRES_PASSWORD`, Redis và Meta hiện tại. Đảm bảo có:
 
 ```dotenv
 MASTER_ENCRYPTION_KEY=YOUR_64_HEX_CHARACTER_KEY
@@ -30,15 +90,13 @@ SESSION_DAYS=30
 COOKIE_SECURE=false
 ```
 
-Tạo khóa mã hóa trên Linux:
+Tạo khóa mã hóa:
 
 ```bash
 openssl rand -hex 32
 ```
 
-Dán kết quả 64 ký tự hex vào `MASTER_ENCRYPTION_KEY`.
-
-Khi chạy production bằng HTTPS, đổi:
+Khi production có HTTPS:
 
 ```dotenv
 COOKIE_SECURE=true
@@ -47,21 +105,21 @@ CORS_ORIGIN=https://ai.tenmiencuaban.com
 META_REDIRECT_URI=https://ai.tenmiencuaban.com/auth/facebook/callback
 ```
 
-`OPENAI_API_KEY` trong `.env` không còn cần thiết ở V2.0. Super Admin nhập key trong Dashboard → OpenAI; key được mã hóa trước khi lưu database.
+OpenAI API Key không cần để trong `.env`; Super Admin nhập trong Dashboard → OpenAI.
 
-## 3. Build và cập nhật database
+## 3. Build và nâng cấp database
 
 ```bash
+cd ~/chatbotAi
+sudo docker compose stop api worker web
 sudo docker compose build api
 sudo docker compose up -d postgres redis
 sudo docker compose run --rm api npx prisma db push
 ```
 
-Schema V2 giữ các cột V1 cần thiết để nâng cấp an toàn. `ownerId` của Page cũ là nullable trong bước chuyển đổi; lệnh tạo Super Admin bên dưới sẽ nhận quyền sở hữu các Page V1 chưa có owner.
+Không dùng `--accept-data-loss` nếu Prisma cảnh báo xóa dữ liệu mà bạn chưa kiểm tra.
 
-## 4. Tạo Super Admin từ terminal
-
-Chạy:
+## 4. Tạo / cập nhật Super Admin
 
 ```bash
 sudo docker compose run --rm api npm run admin:create
@@ -76,17 +134,16 @@ Mật khẩu (>=10 ký tự):
 Nhập lại mật khẩu:
 ```
 
-Mật khẩu được hash bằng scrypt. Chạy lại cùng lệnh và cùng email nếu cần đổi mật khẩu Super Admin.
+Lệnh này:
 
-Lệnh này đồng thời:
+- tạo hoặc cập nhật Super Admin;
+- xóa session cũ của tài khoản admin sau khi đổi mật khẩu;
+- seed cài đặt OpenAI mặc định;
+- seed 4 gói thuê bao + 3 add-on mặc định;
+- gán Page cũ chưa có owner cho Super Admin;
+- không tạo ví tiền.
 
-- tạo Wallet cho Super Admin;
-- seed cài đặt billing mặc định;
-- seed 5 gói tín dụng mặc định;
-- gán Page V1 chưa có chủ sở hữu cho Super Admin;
-- xóa session cũ của tài khoản admin khi đổi mật khẩu.
-
-## 5. Khởi động V2.0
+## 5. Khởi động V2.1
 
 ```bash
 sudo docker compose up -d
@@ -94,78 +151,70 @@ sudo docker compose ps
 curl http://127.0.0.1:4000/health
 ```
 
-API thành công sẽ trả phiên bản `2.0.0`.
+Kết quả API phải có:
 
-Nếu đang dùng SSH tunnel:
-
-```powershell
-gcloud compute ssh TEN_VM --zone=ZONE --project=PROJECT_ID -- -N -L 3000:127.0.0.1:3000 -L 4000:127.0.0.1:4000
+```json
+{"ok":true,"service":"moc-tam-ai-api","version":"2.1.0"}
 ```
 
-Mở `http://localhost:3000` và đăng nhập bằng tài khoản Super Admin vừa tạo.
+## 6. Cấu hình OpenAI
 
-## 6. Cấu hình OpenAI bằng Super Admin
-
-Vào **OpenAI** trong sidebar và nhập:
+Đăng nhập Super Admin → **OpenAI** và cấu hình:
 
 - API Key;
 - model;
-- giá input USD / 1 triệu token;
-- giá output USD / 1 triệu token;
-- tỷ giá USD/VND;
-- markup;
-- minimum credit / lượt;
-- max output tokens.
+- input USD / 1M token;
+- output USD / 1M token;
+- tỷ giá USD/VND để theo dõi chi phí;
+- max output tokens;
+- token / 1 AI Unit;
+- max AI Unit / một câu trả lời.
 
-Mặc định V2 dùng `gpt-4.1-mini`, input `0.40 USD / 1M`, output `1.60 USD / 1M`, tỷ giá `25,910`, markup `3.5`, minimum `20 credit` và max output `400` token. Tất cả đều đổi được từ Dashboard, không cần sửa code.
+Giá token OpenAI trong dashboard chỉ dùng để theo dõi chi phí thật và biên lợi nhuận. Khách hàng mua gói dịch vụ theo AI Unit, không mua token hoặc số dư tiền.
 
-## 7. Cơ chế billing
+## 7. Luồng mua dịch vụ
 
-Worker thực hiện:
+Giai đoạn đầu:
 
 ```text
-Tin Messenger
-  → kiểm tra Page + user
-  → tính reserve theo context và max output
-  → trừ balance, chuyển sang reserved
-  → gọi OpenAI
-  → đọc prompt_tokens / completion_tokens
-  → tính giá vốn VND
-  → nhân markup, áp minimum charge
-  → hoàn phần reserve dư hoặc trừ phần thiếu
-  → ghi AiUsage + CreditTransaction
-  → gửi trả lời qua Facebook
+User chọn gói
+  → hệ thống tạo ServiceOrder + paymentCode
+  → khách thanh toán theo hướng dẫn bán hàng
+  → Super Admin kiểm tra tiền đã nhận
+  → Đơn dịch vụ → Duyệt
+  → hệ thống kích hoạt Subscription hoặc Add-on
 ```
 
-Nếu không đủ credit, Worker không gọi OpenAI và ghi thông báo hệ thống vào hội thoại.
+Khi mua gói thuê bao mới, gói đang hoạt động được kết thúc và gói mới có hiệu lực ngay. Add-on chỉ có thể kích hoạt khi user đang có thuê bao hoạt động.
 
-## 8. Nạp credit V2.0
+Sau này có thể tích hợp payOS/VNPay/VietQR để xác nhận đơn tự động. Payment webhook phải kiểm tra chữ ký và idempotency trước khi tự kích hoạt dịch vụ.
 
-V2.0 hiện triển khai luồng thương mại giai đoạn đầu:
+## 8. Quản trị khách hàng
 
-1. User chọn gói và tạo yêu cầu nạp.
-2. Hệ thống sinh `paymentCode`.
-3. Super Admin kiểm tra thanh toán thực tế.
-4. Vào **Duyệt nạp** → **Duyệt**.
-5. Hệ thống dùng transaction database để đổi trạng thái order và cộng credit đúng một lần.
+Super Admin có thể:
 
-Bước tiếp theo có thể tích hợp payOS / VietQR để webhook tự duyệt order. Không nên bật auto-credit trước khi có xác minh chữ ký webhook và idempotency theo transaction ID.
+- khóa / mở user;
+- gán gói thuê bao thủ công;
+- cộng AI Unit bổ sung vào gói hiện tại;
+- trừ AI Unit bổ sung đã cấp trước đó;
+- duyệt / hủy đơn dịch vụ;
+- tạo, ẩn, sửa gói;
+- xem doanh thu đơn đã duyệt;
+- xem chi phí OpenAI thực tế và số AI Unit đã sử dụng.
 
 ## 9. Facebook OAuth
 
-User vào **Fanpage → Kết nối với Facebook**. OAuth state chứa user ID đã ký HMAC nên callback biết Page thuộc khách hàng nào. Nếu một Facebook Page đã thuộc user khác, hệ thống không tự cướp quyền sở hữu Page đó.
-
-Production cần public HTTPS:
+User vào **Fanpage → Kết nối với Facebook**. Production cần public HTTPS:
 
 ```text
 https://ai.tenmiencuaban.com/auth/facebook/callback
 https://ai.tenmiencuaban.com/webhook
 ```
 
-và Meta App phải có các quyền Page/Messenger phù hợp.
+Meta App cần các quyền Page/Messenger phù hợp và có thể cần App Review / Advanced Access trước khi khách hàng ngoài vai trò App sử dụng.
 
-## 10. Lưu ý production
+## 10. Trước khi bán rộng rãi
 
-Trước khi bán rộng rãi nên hoàn thiện thêm: domain + HTTPS reverse proxy, backup PostgreSQL tự động, email verification / password reset, rate limit phân tán qua Redis, audit log quản trị, thanh toán tự động có xác minh webhook, monitoring, chính sách hoàn tiền, điều khoản sử dụng và cơ chế bảo vệ dữ liệu khách hàng.
+Cần hoàn thiện thêm: domain + HTTPS reverse proxy, backup PostgreSQL tự động, email verification/password reset, rate limit qua Redis, audit log quản trị, payment webhook có chữ ký, monitoring, chính sách hoàn tiền, điều khoản sử dụng và chính sách bảo vệ dữ liệu.
 
 Không commit `.env`, `MASTER_ENCRYPTION_KEY`, Meta App Secret, Page Token hoặc OpenAI API Key lên GitHub.
