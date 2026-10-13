@@ -1,6 +1,14 @@
 .git
+.github
 .env
+.env.*
+!.env.example
 node_modules
+**/node_modules
 web/.next
+**/.next
 npm-debug.log*
 *.log
+*.md
+.gitignore
+Dockerfile*
