@@ -39,6 +39,32 @@ enum AiUsageStatus {
   DELIVERY_FAILED
 }
 
+enum ServicePlanType {
+  SUBSCRIPTION
+  ADDON
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum ServiceOrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+}
+
+enum QuotaTransactionType {
+  PLAN_GRANT
+  ADDON_GRANT
+  AI_RESERVE
+  AI_RELEASE
+  AI_CONSUME
+  ADMIN_ADJUST
+}
+
 model User {
   id                 String              @id @default(cuid())
   email              String              @unique
@@ -48,12 +74,18 @@ model User {
   status             UserStatus          @default(ACTIVE)
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
-  wallet             Wallet?
   sessions           Session[]
   pages              Page[]
+  aiUsages           AiUsage[]
+  subscriptions      Subscription[]
+  serviceOrders      ServiceOrder[]
+  quotaTransactions  QuotaTransaction[]
+
+  // Legacy V2.0 tables are retained only so upgrading with `prisma db push`
+  // does not destructively drop data. V2.1 does not expose or use them.
+  wallet             Wallet?
   creditTransactions CreditTransaction[]
   topupOrders        TopupOrder[]
-  aiUsages           AiUsage[]
 }
 
 model Session {
@@ -68,58 +100,91 @@ model Session {
   @@index([userId, expiresAt])
 }
 
-model Wallet {
-  userId    String   @id
-  balance   Int      @default(0)
-  reserved  Int      @default(0)
-  updatedAt DateTime @updatedAt
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+model ServicePlan {
+  id           String          @id @default(cuid())
+  name         String          @unique
+  type         ServicePlanType
+  priceVnd     Int
+  units        Int
+  durationDays Int             @default(30)
+  maxPages     Int             @default(1)
+  active       Boolean         @default(true)
+  sortOrder    Int             @default(0)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  subscriptions Subscription[]
+  orders       ServiceOrder[]
+
+  @@index([type, active, sortOrder])
 }
 
-model CreditTransaction {
-  id            String                @id @default(cuid())
+model Subscription {
+  id            String             @id @default(cuid())
   userId        String
-  type          CreditTransactionType
-  amount        Int
-  balanceAfter  Int
-  reservedAfter Int                   @default(0)
-  reference     String?               @unique
-  description   String?
-  createdAt     DateTime              @default(now())
-  user          User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planId        String?
+  planName      String
+  baseUnits     Int
+  addonUnits    Int                @default(0)
+  usedUnits     Int                @default(0)
+  reservedUnits Int                @default(0)
+  maxPages      Int                @default(1)
+  startedAt     DateTime           @default(now())
+  expiresAt     DateTime
+  status        SubscriptionStatus @default(ACTIVE)
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+  user          User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan          ServicePlan?       @relation(fields: [planId], references: [id], onDelete: SetNull)
+  quotaTransactions QuotaTransaction[]
+  aiUsages      AiUsage[]
+  orders        ServiceOrder[]
 
-  @@index([userId, createdAt])
+  @@index([userId, status, expiresAt])
 }
 
-model TopupPackage {
-  id        String       @id @default(cuid())
-  name      String       @unique
-  priceVnd  Int
-  credits   Int
-  active    Boolean      @default(true)
-  sortOrder Int          @default(0)
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
-  orders    TopupOrder[]
-}
-
-model TopupOrder {
-  id            String           @id @default(cuid())
-  userId        String
-  packageId     String?
-  amountVnd     Int
-  credits       Int
-  paymentCode   String           @unique
-  provider      String           @default("MANUAL")
-  providerTxnId String?          @unique
-  status        TopupOrderStatus @default(PENDING)
-  createdAt     DateTime         @default(now())
-  paidAt        DateTime?
-  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  package       TopupPackage?    @relation(fields: [packageId], references: [id], onDelete: SetNull)
+model ServiceOrder {
+  id             String             @id @default(cuid())
+  userId         String
+  planId         String?
+  subscriptionId String?
+  planName       String
+  planType       ServicePlanType
+  amountVnd      Int
+  units          Int
+  durationDays   Int                @default(30)
+  maxPages       Int                @default(1)
+  paymentCode    String             @unique
+  provider       String             @default("MANUAL")
+  providerTxnId  String?            @unique
+  status         ServiceOrderStatus @default(PENDING)
+  createdAt      DateTime           @default(now())
+  paidAt         DateTime?
+  activatedAt    DateTime?
+  user           User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan           ServicePlan?       @relation(fields: [planId], references: [id], onDelete: SetNull)
+  subscription   Subscription?      @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
 
   @@index([userId, createdAt])
   @@index([status, createdAt])
+}
+
+model QuotaTransaction {
+  id             String               @id @default(cuid())
+  userId         String
+  subscriptionId String?
+  type           QuotaTransactionType
+  units          Int
+  availableAfter Int
+  usedAfter      Int
+  reservedAfter  Int
+  reference      String?              @unique
+  description    String?
+  createdAt      DateTime             @default(now())
+  user           User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscription   Subscription?        @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([subscriptionId, createdAt])
 }
 
 model SystemSetting {
@@ -191,12 +256,13 @@ model AiUsage {
   userId           String
   pageId           String?
   conversationId   String?
+  subscriptionId   String?
   model            String
   inputTokens      Int           @default(0)
   outputTokens     Int           @default(0)
   realCostVnd      Float         @default(0)
-  retailCredits    Int           @default(0)
-  reservedCredits  Int           @default(0)
+  unitsCharged     Int           @default(0)
+  reservedUnits    Int           @default(0)
   status           AiUsageStatus @default(RESERVED)
   error            String?
   createdAt        DateTime      @default(now())
@@ -204,7 +270,68 @@ model AiUsage {
   user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   page             Page?         @relation(fields: [pageId], references: [id], onDelete: SetNull)
   conversation     Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  subscription     Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  // Legacy V2.0 billing fields. V2.1 keeps them only for migration safety.
+  retailCredits    Int           @default(0)
+  reservedCredits  Int           @default(0)
 
   @@index([userId, createdAt])
   @@index([pageId, createdAt])
+  @@index([subscriptionId, createdAt])
+}
+
+// Legacy V2.0 credit models. They are intentionally not used by V2.1.
+model Wallet {
+  userId    String   @id
+  balance   Int      @default(0)
+  reserved  Int      @default(0)
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model CreditTransaction {
+  id            String                @id @default(cuid())
+  userId        String
+  type          CreditTransactionType
+  amount        Int
+  balanceAfter  Int
+  reservedAfter Int                   @default(0)
+  reference     String?               @unique
+  description   String?
+  createdAt     DateTime              @default(now())
+  user          User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model TopupPackage {
+  id        String       @id @default(cuid())
+  name      String       @unique
+  priceVnd  Int
+  credits   Int
+  active    Boolean      @default(true)
+  sortOrder Int          @default(0)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  orders    TopupOrder[]
+}
+
+model TopupOrder {
+  id            String           @id @default(cuid())
+  userId        String
+  packageId     String?
+  amountVnd     Int
+  credits       Int
+  paymentCode   String           @unique
+  provider      String           @default("MANUAL")
+  providerTxnId String?          @unique
+  status        TopupOrderStatus @default(PENDING)
+  createdAt     DateTime         @default(now())
+  paidAt        DateTime?
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  package       TopupPackage?    @relation(fields: [packageId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
 }
