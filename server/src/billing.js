@@ -3,15 +3,13 @@ const { decryptSecret } = require('./security');
 
 const DEFAULT_SETTINGS = {
   signup_enabled: 'true',
-  signup_bonus: '0',
   openai_model: 'gpt-4.1-mini',
   openai_input_usd_per_million: '0.40',
   openai_output_usd_per_million: '1.60',
   usd_to_vnd: '25910',
-  ai_markup: '3.5',
-  ai_min_credits: '20',
   ai_max_output_tokens: '400',
-  ai_reserve_factor: '1.35',
+  ai_tokens_per_unit: '2500',
+  ai_max_units_per_reply: '3',
 };
 
 async function ensureDefaultSettings() {
@@ -44,10 +42,9 @@ async function getOpenAiConfig() {
     inputUsdPerMillion: positiveNumber(s.openai_input_usd_per_million, 0.4),
     outputUsdPerMillion: positiveNumber(s.openai_output_usd_per_million, 1.6),
     usdToVnd: positiveNumber(s.usd_to_vnd, 25910),
-    markup: positiveNumber(s.ai_markup, 3.5),
-    minCredits: Math.max(1, Math.ceil(positiveNumber(s.ai_min_credits, 20))),
     maxOutputTokens: Math.max(64, Math.min(2000, Math.ceil(positiveNumber(s.ai_max_output_tokens, 400)))),
-    reserveFactor: Math.max(1, positiveNumber(s.ai_reserve_factor, 1.35)),
+    tokensPerUnit: Math.max(500, Math.min(10000, Math.ceil(positiveNumber(s.ai_tokens_per_unit, 2500)))),
+    maxUnitsPerReply: Math.max(1, Math.min(10, Math.ceil(positiveNumber(s.ai_max_units_per_reply, 3)))),
   };
 }
 
@@ -55,109 +52,187 @@ function estimateTokensFromText(text) {
   return Math.max(1, Math.ceil(String(text || '').length / 3.4));
 }
 
-function calculateCharge(config, inputTokens, outputTokens) {
+function calculateRealCost(config, inputTokens, outputTokens) {
   const inputUsd = (Math.max(0, inputTokens) / 1_000_000) * config.inputUsdPerMillion;
   const outputUsd = (Math.max(0, outputTokens) / 1_000_000) * config.outputUsdPerMillion;
-  const realCostVnd = (inputUsd + outputUsd) * config.usdToVnd;
-  const retailCredits = Math.max(config.minCredits, Math.ceil(realCostVnd * config.markup));
-  return { realCostVnd, retailCredits };
+  return (inputUsd + outputUsd) * config.usdToVnd;
 }
 
-function calculateReserve(config, promptText) {
-  const estimatedInput = estimateTokensFromText(promptText);
-  const estimated = calculateCharge(config, estimatedInput, config.maxOutputTokens);
-  return Math.max(config.minCredits, Math.ceil(estimated.retailCredits * config.reserveFactor));
+function calculateUnits(config, inputTokens, outputTokens) {
+  const total = Math.max(1, Number(inputTokens || 0) + Number(outputTokens || 0));
+  return Math.max(1, Math.min(config.maxUnitsPerReply, Math.ceil(total / config.tokensPerUnit)));
 }
 
-async function ensureWallet(userId) {
-  return db.wallet.upsert({ where: { userId }, create: { userId }, update: {} });
+function calculateReserveUnits(config, promptText) {
+  return calculateUnits(config, estimateTokensFromText(promptText), config.maxOutputTokens);
 }
 
-async function reserveCredits(userId, amount, reference, description) {
+function quotaView(subscription) {
+  if (!subscription) return { totalUnits: 0, usedUnits: 0, reservedUnits: 0, availableUnits: 0 };
+  const totalUnits = Math.max(0, subscription.baseUnits + subscription.addonUnits);
+  const usedUnits = Math.max(0, subscription.usedUnits);
+  const reservedUnits = Math.max(0, subscription.reservedUnits);
+  return { totalUnits, usedUnits, reservedUnits, availableUnits: Math.max(0, totalUnits - usedUnits - reservedUnits) };
+}
+
+async function expireOldSubscriptions(userId) {
+  await db.subscription.updateMany({
+    where: { ...(userId ? { userId } : {}), status: 'ACTIVE', expiresAt: { lte: new Date() } },
+    data: { status: 'EXPIRED', reservedUnits: 0 },
+  });
+}
+
+async function getActiveSubscription(userId) {
+  await expireOldSubscriptions(userId);
+  return db.subscription.findFirst({
+    where: { userId, status: 'ACTIVE', startedAt: { lte: new Date() }, expiresAt: { gt: new Date() } },
+    include: { plan: true },
+    orderBy: { startedAt: 'desc' },
+  });
+}
+
+async function createQuotaTransaction(tx, subscription, type, units, reference, description) {
+  const q = quotaView(subscription);
+  return tx.quotaTransaction.create({
+    data: {
+      userId: subscription.userId,
+      subscriptionId: subscription.id,
+      type,
+      units: Math.trunc(units),
+      availableAfter: q.availableUnits,
+      usedAfter: q.usedUnits,
+      reservedAfter: q.reservedUnits,
+      reference,
+      description,
+    },
+  });
+}
+
+async function reserveUnits(userId, amount, reference, description) {
   const reserve = Math.max(1, Math.ceil(Number(amount)));
+  await expireOldSubscriptions(userId);
   return db.$transaction(async tx => {
-    await tx.wallet.upsert({ where: { userId }, create: { userId }, update: {} });
-    const changed = await tx.wallet.updateMany({
-      where: { userId, balance: { gte: reserve } },
-      data: { balance: { decrement: reserve }, reserved: { increment: reserve } },
+    const sub = await tx.subscription.findFirst({
+      where: { userId, status: 'ACTIVE', startedAt: { lte: new Date() }, expiresAt: { gt: new Date() } },
+      orderBy: { startedAt: 'desc' },
     });
-    if (changed.count !== 1) {
-      const err = new Error('Không đủ tín dụng');
-      err.code = 'INSUFFICIENT_CREDIT';
+    if (!sub) {
+      const err = new Error('Không có gói dịch vụ đang hoạt động');
+      err.code = 'NO_ACTIVE_SUBSCRIPTION';
       throw err;
     }
-    const wallet = await tx.wallet.findUnique({ where: { userId } });
-    await tx.creditTransaction.create({
-      data: { userId, type: 'AI_RESERVE', amount: -reserve, balanceAfter: wallet.balance, reservedAfter: wallet.reserved, reference, description },
-    });
-    return wallet;
+    const changed = await tx.$executeRaw`
+      UPDATE "Subscription"
+      SET "reservedUnits" = "reservedUnits" + ${reserve}, "updatedAt" = NOW()
+      WHERE "id" = ${sub.id}
+        AND ("baseUnits" + "addonUnits" - "usedUnits" - "reservedUnits") >= ${reserve}
+    `;
+    if (changed !== 1) {
+      const err = new Error('Đã hết lượt AI trong gói');
+      err.code = 'INSUFFICIENT_QUOTA';
+      throw err;
+    }
+    const updated = await tx.subscription.findUnique({ where: { id: sub.id } });
+    await createQuotaTransaction(tx, updated, 'AI_RESERVE', -reserve, reference, description);
+    return updated;
   });
 }
 
-async function refundCredits(userId, amount, reference, description) {
-  const refund = Math.max(0, Math.ceil(Number(amount)));
-  if (!refund) return ensureWallet(userId);
+async function releaseUnits(userId, subscriptionId, amount, reference, description) {
+  const release = Math.max(0, Math.ceil(Number(amount)));
+  if (!release) return db.subscription.findUnique({ where: { id: subscriptionId } });
   return db.$transaction(async tx => {
-    const current = await tx.wallet.findUnique({ where: { userId } });
-    if (!current) throw new Error('Wallet không tồn tại');
-    const release = Math.min(refund, current.reserved);
-    const wallet = await tx.wallet.update({
-      where: { userId },
-      data: { balance: { increment: release }, reserved: { decrement: release } },
-    });
-    await tx.creditTransaction.create({
-      data: { userId, type: 'AI_REFUND', amount: release, balanceAfter: wallet.balance, reservedAfter: wallet.reserved, reference, description },
-    });
-    return wallet;
+    const sub = await tx.subscription.findUnique({ where: { id: subscriptionId } });
+    if (!sub || sub.userId !== userId) throw new Error('Gói dịch vụ không hợp lệ');
+    const actual = Math.min(release, sub.reservedUnits);
+    if (!actual) return sub;
+    await tx.subscription.update({ where: { id: sub.id }, data: { reservedUnits: { decrement: actual } } });
+    const updated = await tx.subscription.findUnique({ where: { id: sub.id } });
+    await createQuotaTransaction(tx, updated, 'AI_RELEASE', actual, reference, description);
+    return updated;
   });
 }
 
-async function settleCredits(userId, reservedAmount, finalCharge, referenceBase, description) {
+async function settleUnits(userId, subscriptionId, reservedAmount, finalCharge, referenceBase, description) {
   const reserved = Math.max(0, Math.ceil(Number(reservedAmount)));
-  const target = Math.max(0, Math.ceil(Number(finalCharge)));
+  const target = Math.max(1, Math.ceil(Number(finalCharge)));
   return db.$transaction(async tx => {
-    const current = await tx.wallet.findUnique({ where: { userId } });
-    if (!current) throw new Error('Wallet không tồn tại');
-    const releaseReserved = Math.min(reserved, current.reserved);
-    let extra = Math.max(0, target - releaseReserved);
-    let actualExtra = 0;
-    if (extra > 0) {
-      const changed = await tx.wallet.updateMany({
-        where: { userId, balance: { gte: extra } },
-        data: { balance: { decrement: extra } },
-      });
-      if (changed.count === 1) actualExtra = extra;
-    }
-    const refund = Math.max(0, releaseReserved - target);
-    let wallet = await tx.wallet.update({
-      where: { userId },
-      data: { reserved: { decrement: releaseReserved }, balance: refund ? { increment: refund } : undefined },
+    const sub = await tx.subscription.findUnique({ where: { id: subscriptionId } });
+    if (!sub || sub.userId !== userId) throw new Error('Gói dịch vụ không hợp lệ');
+    const releaseReserved = Math.min(reserved, sub.reservedUnits);
+    const q = quotaView(sub);
+    const extraAvailable = q.availableUnits;
+    const charged = Math.min(target, releaseReserved + extraAvailable);
+    const shortfall = Math.max(0, target - charged);
+    await tx.subscription.update({
+      where: { id: sub.id },
+      data: {
+        reservedUnits: { decrement: releaseReserved },
+        usedUnits: { increment: charged },
+      },
     });
-    if (refund > 0) {
-      await tx.creditTransaction.create({ data: { userId, type: 'AI_REFUND', amount: refund, balanceAfter: wallet.balance, reservedAfter: wallet.reserved, reference: `${referenceBase}:refund`, description } });
+    let updated = await tx.subscription.findUnique({ where: { id: sub.id } });
+    if (charged > 0) await createQuotaTransaction(tx, updated, 'AI_CONSUME', -charged, `${referenceBase}:consume`, description);
+    const released = Math.max(0, releaseReserved - charged);
+    if (released > 0) {
+      updated = await tx.subscription.findUnique({ where: { id: sub.id } });
+      await createQuotaTransaction(tx, updated, 'AI_RELEASE', released, `${referenceBase}:release`, 'Hoàn phần AI Unit tạm giữ dư');
     }
-    if (actualExtra > 0) {
-      wallet = await tx.wallet.findUnique({ where: { userId } });
-      await tx.creditTransaction.create({ data: { userId, type: 'AI_EXTRA_CHARGE', amount: -actualExtra, balanceAfter: wallet.balance, reservedAfter: wallet.reserved, reference: `${referenceBase}:extra`, description } });
-    }
-    return { wallet, charged: releaseReserved - refund + actualExtra, shortfall: Math.max(0, target - (releaseReserved - refund + actualExtra)) };
+    return { subscription: updated, charged, shortfall };
   });
 }
 
-async function adjustCredits(userId, amount, type, reference, description) {
+async function adjustQuota(userId, amount, reference, description) {
   const delta = Math.trunc(Number(amount));
-  if (!Number.isFinite(delta) || delta === 0) throw new Error('Số credit không hợp lệ');
+  if (!Number.isFinite(delta) || delta === 0) throw new Error('Số AI Unit không hợp lệ');
+  await expireOldSubscriptions(userId);
   return db.$transaction(async tx => {
-    await tx.wallet.upsert({ where: { userId }, create: { userId }, update: {} });
-    if (delta < 0) {
-      const changed = await tx.wallet.updateMany({ where: { userId, balance: { gte: -delta } }, data: { balance: { increment: delta } } });
-      if (changed.count !== 1) throw new Error('Số dư không đủ để trừ');
+    const sub = await tx.subscription.findFirst({
+      where: { userId, status: 'ACTIVE', expiresAt: { gt: new Date() } },
+      orderBy: { startedAt: 'desc' },
+    });
+    if (!sub) throw new Error('User chưa có gói dịch vụ đang hoạt động');
+    if (delta < 0 && sub.addonUnits < -delta) throw new Error('Chỉ có thể trừ AI Unit bổ sung, không thể trừ quota nền của gói');
+    await tx.subscription.update({ where: { id: sub.id }, data: { addonUnits: { increment: delta } } });
+    const updated = await tx.subscription.findUnique({ where: { id: sub.id } });
+    await createQuotaTransaction(tx, updated, 'ADMIN_ADJUST', delta, reference, description);
+    return updated;
+  });
+}
+
+async function approveServiceOrder(orderId) {
+  return db.$transaction(async tx => {
+    const order = await tx.serviceOrder.findUnique({ where: { id: orderId } });
+    if (!order) throw new Error('Không tìm thấy đơn dịch vụ');
+    if (order.status === 'PAID') return order;
+    if (order.status !== 'PENDING') throw new Error('Đơn không còn ở trạng thái chờ');
+
+    if (order.planType === 'SUBSCRIPTION') {
+      await tx.subscription.updateMany({ where: { userId: order.userId, status: 'ACTIVE' }, data: { status: 'CANCELLED', reservedUnits: 0 } });
+      const startedAt = new Date();
+      const expiresAt = new Date(startedAt.getTime() + Math.max(1, order.durationDays) * 86400000);
+      const sub = await tx.subscription.create({
+        data: {
+          userId: order.userId,
+          planId: order.planId,
+          planName: order.planName,
+          baseUnits: order.units,
+          maxPages: order.maxPages,
+          startedAt,
+          expiresAt,
+        },
+      });
+      await createQuotaTransaction(tx, sub, 'PLAN_GRANT', order.units, `order:${order.id}:plan`, `Kích hoạt gói ${order.planName}`);
+      await tx.serviceOrder.update({ where: { id: order.id }, data: { status: 'PAID', paidAt: new Date(), activatedAt: new Date(), subscriptionId: sub.id } });
     } else {
-      await tx.wallet.update({ where: { userId }, data: { balance: { increment: delta } } });
+      const sub = await tx.subscription.findFirst({ where: { userId: order.userId, status: 'ACTIVE', expiresAt: { gt: new Date() } }, orderBy: { startedAt: 'desc' } });
+      if (!sub) throw new Error('Không thể kích hoạt add-on vì user chưa có gói thuê bao đang hoạt động');
+      await tx.subscription.update({ where: { id: sub.id }, data: { addonUnits: { increment: order.units } } });
+      const updated = await tx.subscription.findUnique({ where: { id: sub.id } });
+      await createQuotaTransaction(tx, updated, 'ADDON_GRANT', order.units, `order:${order.id}:addon`, `Mua add-on ${order.planName}`);
+      await tx.serviceOrder.update({ where: { id: order.id }, data: { status: 'PAID', paidAt: new Date(), activatedAt: new Date(), subscriptionId: sub.id } });
     }
-    const wallet = await tx.wallet.findUnique({ where: { userId } });
-    await tx.creditTransaction.create({ data: { userId, type, amount: delta, balanceAfter: wallet.balance, reservedAfter: wallet.reserved, reference, description } });
-    return wallet;
+    return tx.serviceOrder.findUnique({ where: { id: order.id }, include: { plan: true, subscription: true } });
   });
 }
 
@@ -166,11 +241,16 @@ module.exports = {
   ensureDefaultSettings,
   getSettings,
   getOpenAiConfig,
-  calculateCharge,
-  calculateReserve,
-  ensureWallet,
-  reserveCredits,
-  refundCredits,
-  settleCredits,
-  adjustCredits,
+  estimateTokensFromText,
+  calculateRealCost,
+  calculateUnits,
+  calculateReserveUnits,
+  quotaView,
+  expireOldSubscriptions,
+  getActiveSubscription,
+  reserveUnits,
+  releaseUnits,
+  settleUnits,
+  adjustQuota,
+  approveServiceOrder,
 };
