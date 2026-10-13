@@ -1,42 +1,93 @@
-# Mộc Tâm AI V1.0 — Node.js / Next.js / Docker
+# Mộc Tâm AI V1.1 — Facebook Messenger + OpenAI
 
-MVP cho Facebook Page Messenger: nhận webhook Meta, lưu hội thoại, worker AI, danh mục sản phẩm, quản lý Page và giao diện tiếng Việt.
+Web app Node.js / Next.js / PostgreSQL / Redis / Docker cho Facebook Page Messenger. V1.1 bổ sung **Facebook OAuth**: quản trị viên Page chỉ cần bấm **Kết nối với Facebook**, đăng nhập và cấp quyền; hệ thống tự lấy Page ID, tên Page và Page Access Token rồi lưu vào database.
 
-## Cài đặt trên Debian/Ubuntu có Docker Compose
+## Chạy bằng Docker
 
 ```bash
 cp .env.example .env
 nano .env
-# Sửa POSTGRES_PASSWORD, DATABASE_URL, ADMIN_KEY, META_VERIFY_TOKEN.
-# Mật khẩu POSTGRES_PASSWORD phải trùng mật khẩu trong DATABASE_URL.
 sudo docker compose config --quiet
-sudo docker compose up -d --build
+sudo docker compose build api
+sudo docker compose up -d
 sudo docker compose ps
-sudo docker compose logs --tail=100
 curl http://127.0.0.1:4000/health
 ```
 
-Cổng 3000 và 4000 chỉ bind localhost để tránh công khai giao diện quản trị chưa hoàn thiện. Từ Windows, mở SSH tunnel (đã cài gcloud):
+API, worker và web dùng chung image `chatbotai-app:latest` để giảm dung lượng build.
+
+## Các biến môi trường chính
+
+```dotenv
+DATABASE_URL=postgresql://moc:YOUR_DB_PASSWORD@postgres:5432/mocai?schema=public
+POSTGRES_PASSWORD=YOUR_DB_PASSWORD
+REDIS_URL=redis://redis:6379
+ADMIN_KEY=YOUR_LONG_ADMIN_KEY
+
+META_APP_ID=YOUR_META_APP_ID
+META_APP_SECRET=YOUR_META_APP_SECRET
+META_VERIFY_TOKEN=YOUR_WEBHOOK_VERIFY_TOKEN
+META_OAUTH_STATE_SECRET=YOUR_LONG_RANDOM_OAUTH_SECRET
+META_REDIRECT_URI=https://ai.example.com/auth/facebook/callback
+META_OAUTH_SCOPES=pages_show_list,pages_manage_metadata,pages_messaging,pages_read_engagement
+META_GRAPH_VERSION=v23.0
+PUBLIC_WEB_URL=http://localhost:3000
+
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4.1-mini
+DEMO_MODE=true
+NEXT_PUBLIC_API_URL=http://localhost:4000
+CORS_ORIGIN=http://localhost:3000
+```
+
+`META_REDIRECT_URI` phải khớp chính xác redirect URI đã cấu hình trong Meta App. Khi kết nối Facebook thật, callback OAuth và `/webhook` cần được Meta truy cập qua **HTTPS công khai**.
+
+## Facebook OAuth V1.1
+
+Luồng sử dụng:
+
+1. Người dùng mở **Fanpage → Kết nối với Facebook**.
+2. Backend tạo Facebook OAuth URL có `state` ký HMAC và thời hạn 15 phút.
+3. Người dùng đăng nhập Facebook và cấp quyền Page.
+4. Meta redirect về `/auth/facebook/callback`.
+5. Backend đổi authorization code lấy User Access Token, thử đổi sang long-lived token, gọi `/me/accounts` để lấy các Page quản lý.
+6. Backend lưu Page ID, tên Page và Page Access Token vào PostgreSQL.
+7. Backend thử subscribe từng Page vào webhook `messages,messaging_postbacks`.
+8. Dashboard tự tải lại danh sách Page. Các Page mới được nhập ở trạng thái AI tắt; bật AI sau khi kiểm tra.
+
+Các scope mặc định: `pages_show_list`, `pages_manage_metadata`, `pages_messaging`, `pages_read_engagement`. Tùy loại Meta App và đối tượng người dùng, các quyền này có thể cần Advanced Access/App Review trước khi người ngoài vai trò App có thể sử dụng.
+
+## Cấu hình Meta App
+
+Trong Meta for Developers:
+
+- Tạo/chọn App phù hợp với Facebook Login và Messenger.
+- Lấy **App ID** và **App Secret** đưa vào `.env`.
+- Thêm OAuth Redirect URI chính xác, ví dụ `https://ai.tenmien.com/auth/facebook/callback`.
+- Cấu hình Messenger Webhook, ví dụ `https://ai.tenmien.com/webhook`, với Verify Token bằng `META_VERIFY_TOKEN`.
+- Cấp/được phê duyệt các quyền Page cần thiết.
+
+Không yêu cầu người dùng cuối vào Graph API Explorer hay tự copy Page Access Token.
+
+## Truy cập nội bộ bằng SSH tunnel
+
+Docker mặc định chỉ bind localhost:
+
+- Web: `127.0.0.1:3000`
+- API: `127.0.0.1:4000`
+
+Trên Windows có Google Cloud CLI:
 
 ```powershell
 gcloud compute ssh TEN_VM --zone=ZONE --project=PROJECT_ID -- -N -L 3000:127.0.0.1:3000 -L 4000:127.0.0.1:4000
 ```
 
-Truy cập `http://localhost:3000`, nhập `ADMIN_KEY` trong `.env`.
+Sau đó mở `http://localhost:3000`.
 
-## Thử nghiệm
-1. Tại **Fanpage**, thêm Page ID giả (ví dụ `demo-page`) và bật AI.
-2. Tại **Sản phẩm**, thêm tên và mô tả sản phẩm.
-3. Vào **Thử nghiệm**, gửi tin nhắn; kiểm tra kết quả tại **Hộp thư**.
-4. Nếu không có `OPENAI_API_KEY`, worker trả lời bằng tin nhắn demo. Nếu có API key, AI gọi OpenAI thật ngay cả trong chế độ demo.
+Lưu ý: SSH tunnel đủ để quản trị dashboard, nhưng **không đủ cho Facebook OAuth/Webhook**, vì Meta cần callback HTTPS công khai. Hãy dùng Nginx/Caddy + domain + TLS cho phần `/auth/facebook/callback` và `/webhook`.
 
-## Kết nối Facebook thật
-- Cần Meta App, quyền Messenger phù hợp, Page Access Token, và HTTPS công khai cho `/webhook`.
-- `GET /webhook` xác minh `META_VERIFY_TOKEN`; `POST /webhook` kiểm tra chữ ký `X-Hub-Signature-256` dựa trên `META_APP_SECRET`.
-- Thêm Page ID thật và Page Access Token qua Dashboard; bật AI sau khi kiểm tra kỹ.
-- Chỉ gửi phản hồi trong phạm vi chính sách và cửa sổ tin nhắn Meta cho phép.
+## Bảo mật / giới hạn MVP
 
-## Phạm vi và hạn chế bảo mật của V1.0
-**Chỉ chạy trong môi trường nội bộ/qua SSH tunnel, chưa triển khai public.** MVP dùng khóa quản trị lưu trong sessionStorage, Page Token lưu trong DB chưa mã hóa, chưa có đăng nhập người dùng, RBAC, rate limit, chống lặp outbound khi retry sau khi Meta đã nhận, khóa xử lý theo hội thoại, gửi tin thủ công, hỗ trợ ảnh/đính kèm hoặc quản lý chi phí API. Trước production cần khắc phục các điểm này, thiết lập HTTPS và sao lưu DB. Không chia sẻ file `.env` hoặc token.
+V1.1 vẫn là MVP. `ADMIN_KEY` được lưu trong sessionStorage phía trình duyệt, Page Access Token đang lưu plaintext trong database, chưa có RBAC/user accounts, token encryption-at-rest, rate limit, audit log và cơ chế refresh/re-auth hoàn chỉnh. Trước production cần bổ sung các lớp này và sao lưu PostgreSQL.
 
-Lưu ý: nếu thay `NEXT_PUBLIC_API_URL` (địa chỉ API mà **trình duyệt** có thể truy cập), cần build lại image `web`: `sudo docker compose up -d --build web`. `NEXT_PUBLIC_API_URL=http://localhost:4000` là đúng khi dùng SSH tunnel có cả hai cổng.
+Không commit `.env`, App Secret, Page Access Token hoặc OpenAI API Key lên GitHub.
