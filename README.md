@@ -1,93 +1,171 @@
-# Mộc Tâm AI V1.1 — Facebook Messenger + OpenAI
+# Mộc Tâm AI V2.0 Commercial
 
-Web app Node.js / Next.js / PostgreSQL / Redis / Docker cho Facebook Page Messenger. V1.1 bổ sung **Facebook OAuth**: quản trị viên Page chỉ cần bấm **Kết nối với Facebook**, đăng nhập và cấp quyền; hệ thống tự lấy Page ID, tên Page và Page Access Token rồi lưu vào database.
+Nền tảng SaaS Facebook Messenger AI cho nhiều khách hàng. V2.0 có đăng ký/đăng nhập, phân quyền `SUPER_ADMIN` / `USER`, ví tín dụng, ledger giao dịch, gói nạp, duyệt nạp thủ công, tính phí AI theo token thực tế, Facebook OAuth theo từng user và OpenAI API Key do Super Admin quản lý.
 
-## Chạy bằng Docker
+## Điểm chính V2.0
+
+- Không dùng `ADMIN_KEY` để đăng nhập nữa.
+- Super Admin được tạo từ terminal bằng lệnh tương tác; mật khẩu không cần ghi vào source code.
+- Mỗi user có Wallet riêng và chỉ thấy Page / hội thoại / sản phẩm của mình.
+- Page Access Token và OpenAI API Key được mã hóa AES-256-GCM bằng `MASTER_ENCRYPTION_KEY`.
+- Worker reserve credit trước khi gọi OpenAI, sau đó settle theo token usage thực tế.
+- Hết credit thì không gọi OpenAI.
+- Super Admin có thể cộng/trừ credit, khóa user, duyệt nạp, tạo gói credit, cấu hình model / giá token / tỷ giá / markup / minimum charge.
+- Gói mặc định: 50k→50k, 100k→110k, 200k→230k, 500k→600k, 1tr→1.25tr credit.
+
+## 1. Cập nhật server
 
 ```bash
-cp .env.example .env
-nano .env
-sudo docker compose config --quiet
+cd ~/chatbotAi
+git pull
+```
+
+## 2. Bổ sung cấu hình V2 vào `.env`
+
+Giữ nguyên `DATABASE_URL`, `POSTGRES_PASSWORD`, Redis và Meta hiện tại. Thêm các biến sau:
+
+```dotenv
+MASTER_ENCRYPTION_KEY=YOUR_64_HEX_CHARACTER_KEY
+SESSION_DAYS=30
+COOKIE_SECURE=false
+```
+
+Tạo khóa mã hóa trên Linux:
+
+```bash
+openssl rand -hex 32
+```
+
+Dán kết quả 64 ký tự hex vào `MASTER_ENCRYPTION_KEY`.
+
+Khi chạy production bằng HTTPS, đổi:
+
+```dotenv
+COOKIE_SECURE=true
+PUBLIC_WEB_URL=https://ai.tenmiencuaban.com
+CORS_ORIGIN=https://ai.tenmiencuaban.com
+META_REDIRECT_URI=https://ai.tenmiencuaban.com/auth/facebook/callback
+```
+
+`OPENAI_API_KEY` trong `.env` không còn cần thiết ở V2.0. Super Admin nhập key trong Dashboard → OpenAI; key được mã hóa trước khi lưu database.
+
+## 3. Build và cập nhật database
+
+```bash
 sudo docker compose build api
+sudo docker compose up -d postgres redis
+sudo docker compose run --rm api npx prisma db push
+```
+
+Schema V2 giữ các cột V1 cần thiết để nâng cấp an toàn. `ownerId` của Page cũ là nullable trong bước chuyển đổi; lệnh tạo Super Admin bên dưới sẽ nhận quyền sở hữu các Page V1 chưa có owner.
+
+## 4. Tạo Super Admin từ terminal
+
+Chạy:
+
+```bash
+sudo docker compose run --rm api npm run admin:create
+```
+
+Terminal sẽ hỏi:
+
+```text
+Email admin:
+Tên hiển thị [Super Admin]:
+Mật khẩu (>=10 ký tự):
+Nhập lại mật khẩu:
+```
+
+Mật khẩu được hash bằng scrypt. Chạy lại cùng lệnh và cùng email nếu cần đổi mật khẩu Super Admin.
+
+Lệnh này đồng thời:
+
+- tạo Wallet cho Super Admin;
+- seed cài đặt billing mặc định;
+- seed 5 gói tín dụng mặc định;
+- gán Page V1 chưa có chủ sở hữu cho Super Admin;
+- xóa session cũ của tài khoản admin khi đổi mật khẩu.
+
+## 5. Khởi động V2.0
+
+```bash
 sudo docker compose up -d
 sudo docker compose ps
 curl http://127.0.0.1:4000/health
 ```
 
-API, worker và web dùng chung image `chatbotai-app:latest` để giảm dung lượng build.
+API thành công sẽ trả phiên bản `2.0.0`.
 
-## Các biến môi trường chính
-
-```dotenv
-DATABASE_URL=postgresql://moc:YOUR_DB_PASSWORD@postgres:5432/mocai?schema=public
-POSTGRES_PASSWORD=YOUR_DB_PASSWORD
-REDIS_URL=redis://redis:6379
-ADMIN_KEY=YOUR_LONG_ADMIN_KEY
-
-META_APP_ID=YOUR_META_APP_ID
-META_APP_SECRET=YOUR_META_APP_SECRET
-META_VERIFY_TOKEN=YOUR_WEBHOOK_VERIFY_TOKEN
-META_OAUTH_STATE_SECRET=YOUR_LONG_RANDOM_OAUTH_SECRET
-META_REDIRECT_URI=https://ai.example.com/auth/facebook/callback
-META_OAUTH_SCOPES=pages_show_list,pages_manage_metadata,pages_messaging,pages_read_engagement
-META_GRAPH_VERSION=v23.0
-PUBLIC_WEB_URL=http://localhost:3000
-
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4.1-mini
-DEMO_MODE=true
-NEXT_PUBLIC_API_URL=http://localhost:4000
-CORS_ORIGIN=http://localhost:3000
-```
-
-`META_REDIRECT_URI` phải khớp chính xác redirect URI đã cấu hình trong Meta App. Khi kết nối Facebook thật, callback OAuth và `/webhook` cần được Meta truy cập qua **HTTPS công khai**.
-
-## Facebook OAuth V1.1
-
-Luồng sử dụng:
-
-1. Người dùng mở **Fanpage → Kết nối với Facebook**.
-2. Backend tạo Facebook OAuth URL có `state` ký HMAC và thời hạn 15 phút.
-3. Người dùng đăng nhập Facebook và cấp quyền Page.
-4. Meta redirect về `/auth/facebook/callback`.
-5. Backend đổi authorization code lấy User Access Token, thử đổi sang long-lived token, gọi `/me/accounts` để lấy các Page quản lý.
-6. Backend lưu Page ID, tên Page và Page Access Token vào PostgreSQL.
-7. Backend thử subscribe từng Page vào webhook `messages,messaging_postbacks`.
-8. Dashboard tự tải lại danh sách Page. Các Page mới được nhập ở trạng thái AI tắt; bật AI sau khi kiểm tra.
-
-Các scope mặc định: `pages_show_list`, `pages_manage_metadata`, `pages_messaging`, `pages_read_engagement`. Tùy loại Meta App và đối tượng người dùng, các quyền này có thể cần Advanced Access/App Review trước khi người ngoài vai trò App có thể sử dụng.
-
-## Cấu hình Meta App
-
-Trong Meta for Developers:
-
-- Tạo/chọn App phù hợp với Facebook Login và Messenger.
-- Lấy **App ID** và **App Secret** đưa vào `.env`.
-- Thêm OAuth Redirect URI chính xác, ví dụ `https://ai.tenmien.com/auth/facebook/callback`.
-- Cấu hình Messenger Webhook, ví dụ `https://ai.tenmien.com/webhook`, với Verify Token bằng `META_VERIFY_TOKEN`.
-- Cấp/được phê duyệt các quyền Page cần thiết.
-
-Không yêu cầu người dùng cuối vào Graph API Explorer hay tự copy Page Access Token.
-
-## Truy cập nội bộ bằng SSH tunnel
-
-Docker mặc định chỉ bind localhost:
-
-- Web: `127.0.0.1:3000`
-- API: `127.0.0.1:4000`
-
-Trên Windows có Google Cloud CLI:
+Nếu đang dùng SSH tunnel:
 
 ```powershell
 gcloud compute ssh TEN_VM --zone=ZONE --project=PROJECT_ID -- -N -L 3000:127.0.0.1:3000 -L 4000:127.0.0.1:4000
 ```
 
-Sau đó mở `http://localhost:3000`.
+Mở `http://localhost:3000` và đăng nhập bằng tài khoản Super Admin vừa tạo.
 
-Lưu ý: SSH tunnel đủ để quản trị dashboard, nhưng **không đủ cho Facebook OAuth/Webhook**, vì Meta cần callback HTTPS công khai. Hãy dùng Nginx/Caddy + domain + TLS cho phần `/auth/facebook/callback` và `/webhook`.
+## 6. Cấu hình OpenAI bằng Super Admin
 
-## Bảo mật / giới hạn MVP
+Vào **OpenAI** trong sidebar và nhập:
 
-V1.1 vẫn là MVP. `ADMIN_KEY` được lưu trong sessionStorage phía trình duyệt, Page Access Token đang lưu plaintext trong database, chưa có RBAC/user accounts, token encryption-at-rest, rate limit, audit log và cơ chế refresh/re-auth hoàn chỉnh. Trước production cần bổ sung các lớp này và sao lưu PostgreSQL.
+- API Key;
+- model;
+- giá input USD / 1 triệu token;
+- giá output USD / 1 triệu token;
+- tỷ giá USD/VND;
+- markup;
+- minimum credit / lượt;
+- max output tokens.
 
-Không commit `.env`, App Secret, Page Access Token hoặc OpenAI API Key lên GitHub.
+Mặc định V2 dùng `gpt-4.1-mini`, input `0.40 USD / 1M`, output `1.60 USD / 1M`, tỷ giá `25,910`, markup `3.5`, minimum `20 credit` và max output `400` token. Tất cả đều đổi được từ Dashboard, không cần sửa code.
+
+## 7. Cơ chế billing
+
+Worker thực hiện:
+
+```text
+Tin Messenger
+  → kiểm tra Page + user
+  → tính reserve theo context và max output
+  → trừ balance, chuyển sang reserved
+  → gọi OpenAI
+  → đọc prompt_tokens / completion_tokens
+  → tính giá vốn VND
+  → nhân markup, áp minimum charge
+  → hoàn phần reserve dư hoặc trừ phần thiếu
+  → ghi AiUsage + CreditTransaction
+  → gửi trả lời qua Facebook
+```
+
+Nếu không đủ credit, Worker không gọi OpenAI và ghi thông báo hệ thống vào hội thoại.
+
+## 8. Nạp credit V2.0
+
+V2.0 hiện triển khai luồng thương mại giai đoạn đầu:
+
+1. User chọn gói và tạo yêu cầu nạp.
+2. Hệ thống sinh `paymentCode`.
+3. Super Admin kiểm tra thanh toán thực tế.
+4. Vào **Duyệt nạp** → **Duyệt**.
+5. Hệ thống dùng transaction database để đổi trạng thái order và cộng credit đúng một lần.
+
+Bước tiếp theo có thể tích hợp payOS / VietQR để webhook tự duyệt order. Không nên bật auto-credit trước khi có xác minh chữ ký webhook và idempotency theo transaction ID.
+
+## 9. Facebook OAuth
+
+User vào **Fanpage → Kết nối với Facebook**. OAuth state chứa user ID đã ký HMAC nên callback biết Page thuộc khách hàng nào. Nếu một Facebook Page đã thuộc user khác, hệ thống không tự cướp quyền sở hữu Page đó.
+
+Production cần public HTTPS:
+
+```text
+https://ai.tenmiencuaban.com/auth/facebook/callback
+https://ai.tenmiencuaban.com/webhook
+```
+
+và Meta App phải có các quyền Page/Messenger phù hợp.
+
+## 10. Lưu ý production
+
+Trước khi bán rộng rãi nên hoàn thiện thêm: domain + HTTPS reverse proxy, backup PostgreSQL tự động, email verification / password reset, rate limit phân tán qua Redis, audit log quản trị, thanh toán tự động có xác minh webhook, monitoring, chính sách hoàn tiền, điều khoản sử dụng và cơ chế bảo vệ dữ liệu khách hàng.
+
+Không commit `.env`, `MASTER_ENCRYPTION_KEY`, Meta App Secret, Page Token hoặc OpenAI API Key lên GitHub.
