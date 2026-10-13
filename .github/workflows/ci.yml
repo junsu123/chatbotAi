@@ -1,0 +1,25 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm install --no-audit --no-fund
+      - run: npx prisma generate
+      - run: node --check server/src/api.js
+      - run: node --check server/src/worker.js
+      - run: node --check server/src/security.js
+      - run: node --check server/src/billing.js
+      - run: node --check server/scripts/create-admin.js
+      - run: npm run build:web
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:4000
