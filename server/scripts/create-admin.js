@@ -1,9 +1,22 @@
 require('dotenv').config();
 const readline = require('node:readline/promises');
 const { stdin, stdout } = require('node:process');
-const { db } = require('../src/common');
+const { PrismaClient } = require('@prisma/client');
 const { normalizeEmail, hashPassword, validatePassword } = require('../src/security');
-const { ensureDefaultSettings } = require('../src/billing');
+const db = new PrismaClient();
+
+const DEFAULT_SETTINGS = {
+  signup_enabled: 'true',
+  signup_bonus: '0',
+  openai_model: 'gpt-4.1-mini',
+  openai_input_usd_per_million: '0.40',
+  openai_output_usd_per_million: '1.60',
+  usd_to_vnd: '25910',
+  ai_markup: '3.5',
+  ai_min_credits: '20',
+  ai_max_output_tokens: '400',
+  ai_reserve_factor: '1.35',
+};
 
 async function readVisible(prompt) {
   const rl = readline.createInterface({ input: stdin, output: stdout });
@@ -13,9 +26,7 @@ async function readVisible(prompt) {
 }
 
 function readSecret(prompt) {
-  if (!stdin.isTTY || typeof stdin.setRawMode !== 'function') {
-    return readVisible(prompt);
-  }
+  if (!stdin.isTTY || typeof stdin.setRawMode !== 'function') return readVisible(prompt);
   return new Promise((resolve, reject) => {
     let value = '';
     stdout.write(prompt);
@@ -39,6 +50,12 @@ function readSecret(prompt) {
     };
     stdin.on('data', onData);
   });
+}
+
+async function seedSettings() {
+  for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+    await db.systemSetting.upsert({ where: { key }, create: { key, value }, update: {} });
+  }
 }
 
 async function seedPackages() {
@@ -73,7 +90,7 @@ async function main() {
   await db.wallet.upsert({ where: { userId: user.id }, create: { userId: user.id }, update: {} });
   await db.session.deleteMany({ where: { userId: user.id } });
   await db.page.updateMany({ where: { ownerId: null }, data: { ownerId: user.id } });
-  await ensureDefaultSettings();
+  await seedSettings();
   await seedPackages();
 
   console.log(`\n✓ Super Admin: ${email}`);
