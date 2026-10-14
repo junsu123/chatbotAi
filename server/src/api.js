@@ -2,6 +2,7 @@ const express = require('express');
 const crypto = require('node:crypto');
 const OpenAI = require('openai');
 const { db, queue } = require('./common');
+const { registerSocialAuthRoutes } = require('./social-auth');
 const {
   SESSION_COOKIE, normalizeEmail, hashPassword, verifyPassword, encryptSecret,
   newSessionToken, hashSessionToken, parseCookies, setSessionCookie, clearSessionCookie,
@@ -26,6 +27,8 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
+
+registerSocialAuthRoutes(app);
 
 const fail = (res, e, status = 400) => { console.error(e); res.status(status).json({ error: e.message || 'Request failed' }); };
 const wrap = fn => (req, res) => Promise.resolve(fn(req, res)).catch(e => fail(res, e));
@@ -253,7 +256,17 @@ app.get('/api/facebook/login-url', (req, res) => {
   if (!appId || !redirect || !secret) return res.status(400).json({ error: 'Super Admin chưa cấu hình Meta App trên máy chủ' });
   const scopes = process.env.META_OAUTH_SCOPES || 'pages_show_list,pages_manage_metadata,pages_messaging,pages_read_engagement';
   const u = new URL(`https://www.facebook.com/${graphVersion()}/dialog/oauth`);
-  u.searchParams.set('client_id', appId); u.searchParams.set('redirect_uri', redirect); u.searchParams.set('state', makeOauthState(req.user.id)); u.searchParams.set('scope', scopes); u.searchParams.set('response_type', 'code');
+  u.searchParams.set('client_id', appId);
+  u.searchParams.set('redirect_uri', redirect);
+  u.searchParams.set('state', makeOauthState(req.user.id));
+  u.searchParams.set('response_type', 'code');
+  const configId = String(process.env.META_LOGIN_CONFIG_ID || '').trim();
+  if (configId) {
+    u.searchParams.set('config_id', configId);
+    u.searchParams.set('override_default_response_type', 'true');
+  } else {
+    u.searchParams.set('scope', scopes);
+  }
   res.json({ url: u.toString() });
 });
 
