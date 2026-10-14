@@ -20,6 +20,7 @@ jobs:
       - run: node --check server/src/billing.js
       - run: node --check server/src/meta-observability.js
       - run: node --check server/src/social-auth.js
+      - run: node --check server/src/account-auth.js
       - run: node --check server/scripts/create-admin.js
       - run: npm run build:web
         env:
