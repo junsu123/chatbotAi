@@ -18,6 +18,7 @@ jobs:
       - run: node --check server/src/worker.js
       - run: node --check server/src/security.js
       - run: node --check server/src/billing.js
+      - run: node --check server/src/meta-observability.js
       - run: node --check server/scripts/create-admin.js
       - run: npm run build:web
         env:
