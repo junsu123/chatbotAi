@@ -3,11 +3,10 @@ const { db } = require('./common');
 const {
   SESSION_COOKIE,
   normalizeEmail,
-  newSessionToken,
   hashSessionToken,
   parseCookies,
-  setSessionCookie,
 } = require('./security');
+const { createSession } = require('./account-auth');
 const { getSettings } = require('./billing');
 
 const STATE_COOKIE = 'moc_social_oauth';
@@ -84,19 +83,6 @@ async function currentUser(req) {
   return session.user;
 }
 
-async function createSession(res, userId) {
-  const token = newSessionToken();
-  const days = Math.max(1, Number(process.env.SESSION_DAYS || 30));
-  await db.session.create({
-    data: {
-      tokenHash: hashSessionToken(token),
-      userId,
-      expiresAt: new Date(Date.now() + days * 86400000),
-    },
-  });
-  setSessionCookie(res, token);
-}
-
 function redirectUri(provider) {
   if (provider === 'google') {
     return String(process.env.GOOGLE_REDIRECT_URI || `${publicWebUrl()}/auth/social/google/callback`);
@@ -146,6 +132,9 @@ async function resolveSocialUser({ provider, providerUserId, email, name, emailV
   });
   if (linked) {
     if (linked.user.status !== 'ACTIVE') throw new Error('Tài khoản đang bị khóa');
+    if (emailVerified && !linked.user.emailVerifiedAt) {
+      return db.user.update({ where: { id: linked.user.id }, data: { emailVerifiedAt: new Date() } });
+    }
     return linked.user;
   }
 
@@ -155,16 +144,16 @@ async function resolveSocialUser({ provider, providerUserId, email, name, emailV
     const emailOwner = await db.user.findUnique({ where: { email: normalizedEmail } });
     if (emailOwner && emailOwner.id !== user.id) throw new Error('Email mạng xã hội đang thuộc một tài khoản Mộc Tâm AI khác');
     await db.oAuthAccount.create({ data: { userId: user.id, provider, providerUserId: providerId, providerEmail: normalizedEmail } });
+    if (emailVerified && !user.emailVerifiedAt) return db.user.update({ where: { id: user.id }, data: { emailVerifiedAt: new Date() } });
     return user;
   }
 
   const existing = await db.user.findUnique({ where: { email: normalizedEmail } });
   if (existing) {
-    // Google explicitly asserts email_verified. This makes linking an existing email account safe enough
-    // without asking the user to create a second Mộc Tâm AI account.
     if (provider === 'google' && emailVerified) {
       if (existing.status !== 'ACTIVE') throw new Error('Tài khoản đang bị khóa');
       await db.oAuthAccount.create({ data: { userId: existing.id, provider, providerUserId: providerId, providerEmail: normalizedEmail } });
+      if (!existing.emailVerifiedAt) return db.user.update({ where: { id: existing.id }, data: { emailVerifiedAt: new Date() } });
       return existing;
     }
     throw new Error('Email này đã có tài khoản Mộc Tâm AI. Hãy đăng nhập tài khoản hiện có trước khi liên kết Facebook.');
@@ -180,6 +169,7 @@ async function resolveSocialUser({ provider, providerUserId, email, name, emailV
           email: normalizedEmail,
           name: String(name || normalizedEmail.split('@')[0]).trim().slice(0, 100) || 'Người dùng',
           passwordHash: null,
+          emailVerifiedAt: emailVerified ? new Date() : null,
         },
       });
       await tx.oAuthAccount.create({
@@ -284,7 +274,7 @@ function registerSocialAuthRoutes(app) {
       if (!code) throw new Error('Google không trả authorization code');
       const profile = await googleProfile(code);
       const user = await resolveSocialUser({ provider: 'google', ...profile, linkUserId: state.linkUserId });
-      await createSession(res, user.id);
+      await createSession(req, res, user.id);
       socialSuccess(res, 'google');
     } catch (e) { socialError(res, 'google', e); }
   });
@@ -320,7 +310,7 @@ function registerSocialAuthRoutes(app) {
       if (!code) throw new Error('Facebook không trả authorization code');
       const profile = await facebookProfile(code);
       const user = await resolveSocialUser({ provider: 'facebook', ...profile, linkUserId: state.linkUserId });
-      await createSession(res, user.id);
+      await createSession(req, res, user.id);
       socialSuccess(res, 'facebook');
     } catch (e) { socialError(res, 'facebook', e); }
   });
