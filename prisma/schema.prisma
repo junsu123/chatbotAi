@@ -13,8 +13,24 @@ enum UserRole {
 }
 
 enum UserStatus {
+  PENDING_VERIFICATION
   ACTIVE
   SUSPENDED
+}
+
+enum VerificationChannel {
+  EMAIL
+  SMS
+}
+
+enum VerificationPurpose {
+  SIGNUP
+  VERIFY_EMAIL
+  VERIFY_PHONE
+  CHANGE_EMAIL
+  CHANGE_PHONE
+  PASSWORD_CHANGE
+  PASSWORD_RESET
 }
 
 enum CreditTransactionType {
@@ -68,14 +84,20 @@ enum QuotaTransactionType {
 model User {
   id                 String              @id @default(cuid())
   email              String              @unique
+  phone              String?             @unique
   passwordHash       String?
   name               String
   role               UserRole            @default(USER)
   status             UserStatus          @default(ACTIVE)
+  emailVerifiedAt    DateTime?
+  phoneVerifiedAt    DateTime?
+  failedLoginCount   Int                 @default(0)
+  lockedUntil        DateTime?
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
   sessions           Session[]
   oauthAccounts      OAuthAccount[]
+  verificationCodes  VerificationCode[]
   pages              Page[]
   aiUsages           AiUsage[]
   subscriptions      Subscription[]
@@ -83,7 +105,7 @@ model User {
   quotaTransactions  QuotaTransaction[]
 
   // Legacy V2.0 tables are retained only so upgrading with `prisma db push`
-  // does not destructively drop data. V2.1 does not expose or use them.
+  // does not destructively drop data. V2.1+ does not expose or use them.
   wallet             Wallet?
   creditTransactions CreditTransaction[]
   topupOrders        TopupOrder[]
@@ -110,9 +132,30 @@ model Session {
   expiresAt  DateTime
   createdAt  DateTime @default(now())
   lastSeenAt DateTime @default(now())
+  userAgent  String?
+  ipAddress  String?
+  deviceName String?
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, expiresAt])
+}
+
+model VerificationCode {
+  id          String              @id @default(cuid())
+  userId      String?
+  purpose     VerificationPurpose
+  channel     VerificationChannel
+  destination String
+  codeHash    String
+  expiresAt   DateTime
+  attempts    Int                 @default(0)
+  consumedAt  DateTime?
+  createdAt   DateTime            @default(now())
+  user        User?               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose, createdAt])
+  @@index([destination, purpose, createdAt])
+  @@index([expiresAt])
 }
 
 model ServicePlan {
@@ -287,7 +330,7 @@ model AiUsage {
   conversation     Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
   subscription     Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
 
-  // Legacy V2.0 billing fields. V2.1 keeps them only for migration safety.
+  // Legacy V2.0 billing fields. V2.1+ keeps them only for migration safety.
   retailCredits    Int           @default(0)
   reservedCredits  Int           @default(0)
 
@@ -296,7 +339,7 @@ model AiUsage {
   @@index([subscriptionId, createdAt])
 }
 
-// Legacy V2.0 credit models. They are intentionally not used by V2.1.
+// Legacy V2.0 credit models. They are intentionally not used by V2.1+.
 model Wallet {
   userId    String   @id
   balance   Int      @default(0)
