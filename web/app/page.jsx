@@ -38,6 +38,16 @@ export default function Home() {
   }, [api, me]);
 
   useEffect(() => { api('/auth/me').then(x => setMe(x.user)).catch(() => {}).finally(() => setBooting(false)); }, [api]);
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    const socialError = q.get('social_error');
+    const provider = q.get('social_provider');
+    if (socialError) setError(socialError);
+    else if (q.get('social') === 'success') setInfo(`Đăng nhập bằng ${provider === 'facebook' ? 'Facebook' : 'Google'} thành công`);
+    if (q.has('social') || q.has('social_error') || q.has('social_provider')) {
+      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+    }
+  }, []);
   useEffect(() => { if (!me) return; refresh(); const id = setInterval(refresh, 15000); return () => clearInterval(id); }, [me, refresh]);
   useEffect(() => { if (!selected || !me) return; const load = () => api('/api/conversations/' + selected + '/messages').then(setMessages).catch(() => {}); load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, [selected, me, api]);
   useEffect(() => { const h = e => { if (e.data?.type === 'moc-facebook-connected') { e.data.ok ? setInfo(`Đã kết nối ${e.data.count || 0} Fanpage`) : setError(e.data.error || 'Kết nối Facebook thất bại'); refresh(); } }; window.addEventListener('message', h); return () => window.removeEventListener('message', h); }, [refresh]);
@@ -52,7 +62,7 @@ export default function Home() {
   async function connectFacebook() { try { const x = await api('/api/facebook/login-url'); window.open(x.url, 'moc-facebook', 'width=620,height=760'); } catch (e) { setError(e.message); } }
 
   if (booting) return <div className="center">Đang tải Mộc Tâm AI V2.1…</div>;
-  if (!me) return <div className="authPage"><div className="authCard"><div className="brand">✦ MỘC TÂM AI</div><h1>{mode === 'login' ? 'Đăng nhập' : 'Tạo tài khoản'}</h1><p className="sub">Facebook Messenger AI · V2.1 Subscription</p>{error && <p className="error box">{error}</p>}<form onSubmit={submitAuth}>{mode === 'register' && <label>Họ tên<input value={authForm.name} onChange={e => setAuthForm({ ...authForm, name: e.target.value })} required /></label>}<label>Email<input type="email" value={authForm.email} onChange={e => setAuthForm({ ...authForm, email: e.target.value })} required /></label><label>Mật khẩu<input type="password" minLength={10} value={authForm.password} onChange={e => setAuthForm({ ...authForm, password: e.target.value })} required /></label><button className="btn wide" type="submit">{mode === 'login' ? 'Đăng nhập' : 'Đăng ký'}</button></form><button className="linkBtn" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); }}>{mode === 'login' ? 'Chưa có tài khoản? Đăng ký' : 'Đã có tài khoản? Đăng nhập'}</button></div></div>;
+  if (!me) return <div className="authPage"><div className="authCard"><div className="brand">✦ MỘC TÂM AI</div><h1>{mode === 'login' ? 'Đăng nhập' : 'Tạo tài khoản'}</h1><p className="sub">Facebook Messenger AI · V2.1 Subscription</p>{error && <p className="error box">{error}</p>}<div className="socialButtons"><a className="socialBtn google" href={BASE + '/auth/social/google/start'}><span className="socialIcon">G</span>{mode === 'login' ? 'Đăng nhập' : 'Đăng ký'} bằng Google</a><a className="socialBtn facebook" href={BASE + '/auth/social/facebook/start'}><span className="socialIcon">f</span>{mode === 'login' ? 'Đăng nhập' : 'Đăng ký'} bằng Facebook</a></div><div className="socialDivider"><span>hoặc dùng email</span></div><form onSubmit={submitAuth}>{mode === 'register' && <label>Họ tên<input value={authForm.name} onChange={e => setAuthForm({ ...authForm, name: e.target.value })} required /></label>}<label>Email<input type="email" value={authForm.email} onChange={e => setAuthForm({ ...authForm, email: e.target.value })} required /></label><label>Mật khẩu<input type="password" minLength={10} value={authForm.password} onChange={e => setAuthForm({ ...authForm, password: e.target.value })} required /></label><button className="btn wide" type="submit">{mode === 'login' ? 'Đăng nhập' : 'Đăng ký'}</button></form><button className="linkBtn" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); }}>{mode === 'login' ? 'Chưa có tài khoản? Đăng ký' : 'Đã có tài khoản? Đăng nhập'}</button><p className="authLegal">Lần đầu đăng nhập bằng Google/Facebook sẽ tự tạo tài khoản. Bằng việc tiếp tục, bạn đồng ý với <a href="/terms">Điều khoản dịch vụ</a> và <a href="/privacy">Chính sách quyền riêng tư</a>.</p></div></div>;
 
   const admin = me.role === 'SUPER_ADMIN';
   const quota = service.quota || dashboard.service?.quota || {};
