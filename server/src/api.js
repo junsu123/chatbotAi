@@ -4,8 +4,13 @@ const OpenAI = require('openai');
 const { db, queue } = require('./common');
 const { registerSocialAuthRoutes } = require('./social-auth');
 const {
-  SESSION_COOKIE, normalizeEmail, hashPassword, verifyPassword, encryptSecret,
-  newSessionToken, hashSessionToken, parseCookies, setSessionCookie, clearSessionCookie,
+  publicUser,
+  requireCompleteProfile,
+  registerPublicAccountRoutes,
+  registerProtectedAccountRoutes,
+} = require('./account-auth');
+const {
+  SESSION_COOKIE, encryptSecret, hashSessionToken, parseCookies, clearSessionCookie,
 } = require('./security');
 const {
   ensureDefaultSettings, getSettings, getOpenAiConfig, quotaView,
@@ -29,6 +34,7 @@ app.use((req, res, next) => {
 });
 
 registerSocialAuthRoutes(app);
+registerPublicAccountRoutes(app);
 
 const fail = (res, e, status = 400) => { console.error(e); res.status(status).json({ error: e.message || 'Request failed' }); };
 const wrap = fn => (req, res) => Promise.resolve(fn(req, res)).catch(e => fail(res, e));
@@ -55,17 +61,6 @@ async function auth(req, res, next) {
 function superAdmin(req, res, next) {
   if (req.user?.role !== 'SUPER_ADMIN') return res.status(403).json({ error: 'Chỉ Super Admin được phép thực hiện thao tác này' });
   next();
-}
-
-function publicUser(user) {
-  return { id: user.id, email: user.email, name: user.name, role: user.role, status: user.status };
-}
-
-async function createSession(res, userId) {
-  const token = newSessionToken();
-  const days = Math.max(1, Number(process.env.SESSION_DAYS || 30));
-  await db.session.create({ data: { tokenHash: hashSessionToken(token), userId, expiresAt: new Date(Date.now() + days * 86400000) } });
-  setSessionCookie(res, token);
 }
 
 async function graphJson(url, options) {
@@ -156,7 +151,7 @@ async function serviceSnapshot(user) {
   return { unlimited: false, subscription, quota: quotaView(subscription) };
 }
 
-app.get('/health', (req, res) => res.json({ ok: true, service: 'moc-tam-ai-api', version: '2.1.0' }));
+app.get('/health', (req, res) => res.json({ ok: true, service: 'moc-tam-ai-api', version: '2.2.0' }));
 
 app.get('/webhook', (req, res) => {
   const q = req.query;
@@ -176,28 +171,6 @@ app.post('/webhook', wrap(async (req, res) => {
     await queue.add('incoming', { pageId: String(evt.recipient.id), senderId: String(evt.sender.id), mid: String(m.mid), text: m.text, demo: false }, { jobId: 'in-' + crypto.createHash('sha256').update(String(m.mid)).digest('hex'), attempts: 1, removeOnComplete: 1000 });
   }
   res.send('EVENT_RECEIVED');
-}));
-
-app.post('/auth/register', wrap(async (req, res) => {
-  const settings = await getSettings();
-  if (settings.signup_enabled !== 'true') return res.status(403).json({ error: 'Hệ thống đang tắt đăng ký tài khoản mới' });
-  const email = normalizeEmail(req.body.email);
-  const name = String(req.body.name || '').trim().slice(0, 100);
-  if (!/^\S+@\S+\.\S+$/.test(email) || !name) return res.status(400).json({ error: 'Tên hoặc email không hợp lệ' });
-  if (await db.user.findUnique({ where: { email } })) return res.status(409).json({ error: 'Email đã được sử dụng' });
-  const passwordHash = await hashPassword(req.body.password);
-  const user = await db.user.create({ data: { email, name, passwordHash } });
-  await createSession(res, user.id);
-  res.json({ user: publicUser(user) });
-}));
-
-app.post('/auth/login', wrap(async (req, res) => {
-  const email = normalizeEmail(req.body.email);
-  const user = await db.user.findUnique({ where: { email } });
-  if (!user || !(await verifyPassword(req.body.password, user.passwordHash))) return res.status(401).json({ error: 'Email hoặc mật khẩu không đúng' });
-  if (user.status !== 'ACTIVE') return res.status(403).json({ error: 'Tài khoản đang bị khóa' });
-  await createSession(res, user.id);
-  res.json({ user: publicUser(user) });
 }));
 
 app.post('/auth/logout', async (req, res) => {
@@ -237,6 +210,8 @@ app.get('/auth/facebook/callback', async (req, res) => {
 });
 
 app.use('/api', auth);
+registerProtectedAccountRoutes(app);
+app.use('/api', requireCompleteProfile);
 
 app.get('/api/dashboard', wrap(async (req, res) => {
   const usageWhere = req.user.role === 'SUPER_ADMIN' ? {} : { userId: req.user.id };
@@ -362,7 +337,7 @@ app.get('/api/admin/overview', wrap(async (req, res) => {
 }));
 app.get('/api/admin/users', wrap(async (req, res) => res.json(await db.user.findMany({
   select: {
-    id: true, email: true, name: true, role: true, status: true, createdAt: true,
+    id: true, email: true, phone: true, name: true, role: true, status: true, emailVerifiedAt: true, phoneVerifiedAt: true, createdAt: true,
     subscriptions: { where: { status: 'ACTIVE', expiresAt: { gt: new Date() } }, orderBy: { startedAt: 'desc' }, take: 1 },
     _count: { select: { pages: true, aiUsages: true } },
   },
@@ -371,7 +346,7 @@ app.get('/api/admin/users', wrap(async (req, res) => res.json(await db.user.find
 app.patch('/api/admin/users/:id', wrap(async (req, res) => {
   if (req.params.id === req.user.id && req.body.status === 'SUSPENDED') return res.status(400).json({ error: 'Không thể tự khóa tài khoản Super Admin đang đăng nhập' });
   const data = {}; if (['ACTIVE', 'SUSPENDED'].includes(req.body.status)) data.status = req.body.status;
-  res.json(await db.user.update({ where: { id: req.params.id }, data, select: { id: true, email: true, status: true, role: true } }));
+  res.json(await db.user.update({ where: { id: req.params.id }, data, select: { id: true, email: true, phone: true, status: true, role: true } }));
 }));
 app.post('/api/admin/users/:id/quota', wrap(async (req, res) => {
   const amount = Math.trunc(Number(req.body.amount));
@@ -455,4 +430,4 @@ app.post('/api/admin/openai/test', wrap(async (req, res) => {
 }));
 
 ensureDefaultSettings().catch(e => console.error('Default settings:', e.message));
-app.listen(4000, '0.0.0.0', () => console.log('Mộc Tâm AI V2.1 API listening on 4000'));
+app.listen(4000, '0.0.0.0', () => console.log('Mộc Tâm AI V2.2 API listening on 4000'));
