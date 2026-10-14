@@ -1,5 +1,5 @@
 'use client';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 const BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
 const money = n => Number(n || 0).toLocaleString('vi-VN');
@@ -7,7 +7,10 @@ const dt = v => v ? new Date(v).toLocaleString('vi-VN') : '—';
 
 export default function Home() {
   const [me, setMe] = useState(null), [booting, setBooting] = useState(true), [mode, setMode] = useState('login');
-  const [authForm, setAuthForm] = useState({ name: '', email: '', password: '' });
+  const [authForm, setAuthForm] = useState({ name: '', email: '', phone: '', identifier: '', password: '', verificationChannel: 'EMAIL' });
+  const [pendingSignup, setPendingSignup] = useState(null), [signupCode, setSignupCode] = useState('');
+  const [resetForm, setResetForm] = useState({ identifier: '', channel: 'EMAIL', code: '', newPassword: '' });
+  const [resetRequested, setResetRequested] = useState(false);
   const [tab, setTab] = useState('Tổng quan'), [error, setError] = useState(''), [info, setInfo] = useState('');
   const [dashboard, setDashboard] = useState({}), [pages, setPages] = useState([]), [convs, setConvs] = useState([]), [products, setProducts] = useState([]);
   const [service, setService] = useState({ quota: {}, plans: [], orders: [], transactions: [] });
@@ -20,12 +23,12 @@ export default function Home() {
   const api = useCallback(async (path, method = 'GET', data) => {
     const r = await fetch(BASE + path, { method, credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: data ? JSON.stringify(data) : undefined, cache: 'no-store' });
     let out = {}; try { out = await r.json(); } catch {}
-    if (!r.ok) { const e = new Error(out.error || `HTTP ${r.status}`); e.status = r.status; throw e; }
+    if (!r.ok) { const e = new Error(out.error || `HTTP ${r.status}`); e.status = r.status; e.code = out.code; e.data = out; throw e; }
     return out;
   }, []);
 
   const refresh = useCallback(async () => {
-    if (!me) return;
+    if (!me || (!me.profileComplete && me.role !== 'SUPER_ADMIN')) return;
     try {
       const [d, p, c, pr, s] = await Promise.all([api('/api/dashboard'), api('/api/pages'), api('/api/conversations'), api('/api/products'), api('/api/service')]);
       setDashboard(d); setPages(p); setConvs(c); setProducts(pr); setService(s);
@@ -44,34 +47,74 @@ export default function Home() {
     const provider = q.get('social_provider');
     if (socialError) setError(socialError);
     else if (q.get('social') === 'success') setInfo(`Đăng nhập bằng ${provider === 'facebook' ? 'Facebook' : 'Google'} thành công`);
-    if (q.has('social') || q.has('social_error') || q.has('social_provider')) {
-      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
-    }
+    if (q.has('social') || q.has('social_error') || q.has('social_provider')) window.history.replaceState({}, '', window.location.pathname + window.location.hash);
   }, []);
-  useEffect(() => { if (!me) return; refresh(); const id = setInterval(refresh, 15000); return () => clearInterval(id); }, [me, refresh]);
-  useEffect(() => { if (!selected || !me) return; const load = () => api('/api/conversations/' + selected + '/messages').then(setMessages).catch(() => {}); load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, [selected, me, api]);
+  useEffect(() => { if (!me || (!me.profileComplete && me.role !== 'SUPER_ADMIN')) return; refresh(); const id = setInterval(refresh, 15000); return () => clearInterval(id); }, [me, refresh]);
+  useEffect(() => { if (!selected || !me?.profileComplete) return; const load = () => api('/api/conversations/' + selected + '/messages').then(setMessages).catch(() => {}); load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, [selected, me, api]);
   useEffect(() => { const h = e => { if (e.data?.type === 'moc-facebook-connected') { e.data.ok ? setInfo(`Đã kết nối ${e.data.count || 0} Fanpage`) : setError(e.data.error || 'Kết nối Facebook thất bại'); refresh(); } }; window.addEventListener('message', h); return () => window.removeEventListener('message', h); }, [refresh]);
 
   async function submitAuth(e) {
-    e.preventDefault(); setError('');
-    try { const out = await api(mode === 'login' ? '/auth/login' : '/auth/register', 'POST', authForm); setMe(out.user); setTab('Tổng quan'); }
-    catch (e) { setError(e.message); }
+    e.preventDefault(); setError(''); setInfo('');
+    try {
+      if (mode === 'login') {
+        const out = await api('/auth/login', 'POST', { identifier: authForm.identifier, password: authForm.password });
+        setMe(out.user); setTab('Tổng quan');
+      } else {
+        const out = await api('/auth/register', 'POST', authForm);
+        setPendingSignup(out); setMode('verify');
+        setInfo(`Mã xác nhận đã gửi tới ${out.destination}` + (out.devCode ? ` · DEV: ${out.devCode}` : ''));
+      }
+    } catch (e) { setError(e.message); }
   }
+
+  async function verifySignup(e) {
+    e.preventDefault(); setError('');
+    try {
+      const out = await api('/auth/register/verify', 'POST', { userId: pendingSignup.userId, channel: pendingSignup.channel, code: signupCode });
+      setMe(out.user); setMode('login'); setTab('Tổng quan'); setInfo('Đăng ký và xác minh tài khoản thành công');
+    } catch (e) { setError(e.message); }
+  }
+
+  async function resendSignup(channel = pendingSignup?.channel || 'EMAIL') {
+    try {
+      const out = await api('/auth/register/resend', 'POST', { userId: pendingSignup.userId, channel });
+      setPendingSignup({ ...pendingSignup, ...out, channel });
+      setInfo(`Đã gửi mã mới tới ${out.destination}` + (out.devCode ? ` · DEV: ${out.devCode}` : ''));
+    } catch (e) { setError(e.message); }
+  }
+
+  async function requestReset(e) {
+    e.preventDefault(); setError('');
+    try {
+      const out = await api('/auth/password/reset/request', 'POST', { identifier: resetForm.identifier, channel: resetForm.channel });
+      setResetRequested(true); setInfo(out.message + (out.devCode ? ` DEV: ${out.devCode}` : ''));
+    } catch (e) { setError(e.message); }
+  }
+
+  async function confirmReset(e) {
+    e.preventDefault(); setError('');
+    try {
+      await api('/auth/password/reset/confirm', 'POST', resetForm);
+      setInfo('Đã đặt lại mật khẩu. Hãy đăng nhập lại.'); setMode('login'); setResetRequested(false); setAuthForm({ ...authForm, identifier: resetForm.identifier, password: '' });
+    } catch (e) { setError(e.message); }
+  }
+
   async function logout() { await api('/auth/logout', 'POST').catch(() => {}); setMe(null); setSelected(''); }
   async function save(path, method, data, message = 'Đã lưu') { try { await api(path, method, data); setInfo(message); setError(''); await refresh(); } catch (e) { setError(e.message); } }
   async function connectFacebook() { try { const x = await api('/api/facebook/login-url'); window.open(x.url, 'moc-facebook', 'width=620,height=760'); } catch (e) { setError(e.message); } }
 
-  if (booting) return <div className="center">Đang tải Mộc Tâm AI V2.1…</div>;
-  if (!me) return <div className="authPage"><div className="authCard"><div className="brand">✦ MỘC TÂM AI</div><h1>{mode === 'login' ? 'Đăng nhập' : 'Tạo tài khoản'}</h1><p className="sub">Facebook Messenger AI · V2.1 Subscription</p>{error && <p className="error box">{error}</p>}<div className="socialButtons"><a className="socialBtn google" href={BASE + '/auth/social/google/start'}><span className="socialIcon">G</span>{mode === 'login' ? 'Đăng nhập' : 'Đăng ký'} bằng Google</a><a className="socialBtn facebook" href={BASE + '/auth/social/facebook/start'}><span className="socialIcon">f</span>{mode === 'login' ? 'Đăng nhập' : 'Đăng ký'} bằng Facebook</a></div><div className="socialDivider"><span>hoặc dùng email</span></div><form onSubmit={submitAuth}>{mode === 'register' && <label>Họ tên<input value={authForm.name} onChange={e => setAuthForm({ ...authForm, name: e.target.value })} required /></label>}<label>Email<input type="email" value={authForm.email} onChange={e => setAuthForm({ ...authForm, email: e.target.value })} required /></label><label>Mật khẩu<input type="password" minLength={10} value={authForm.password} onChange={e => setAuthForm({ ...authForm, password: e.target.value })} required /></label><button className="btn wide" type="submit">{mode === 'login' ? 'Đăng nhập' : 'Đăng ký'}</button></form><button className="linkBtn" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); }}>{mode === 'login' ? 'Chưa có tài khoản? Đăng ký' : 'Đã có tài khoản? Đăng nhập'}</button><p className="authLegal">Lần đầu đăng nhập bằng Google/Facebook sẽ tự tạo tài khoản. Bằng việc tiếp tục, bạn đồng ý với <a href="/terms">Điều khoản dịch vụ</a> và <a href="/privacy">Chính sách quyền riêng tư</a>.</p></div></div>;
+  if (booting) return <div className="center">Đang tải Mộc Tâm AI V2.2…</div>;
+  if (!me) return <AuthScreen mode={mode} setMode={setMode} authForm={authForm} setAuthForm={setAuthForm} submitAuth={submitAuth} pendingSignup={pendingSignup} signupCode={signupCode} setSignupCode={setSignupCode} verifySignup={verifySignup} resendSignup={resendSignup} resetForm={resetForm} setResetForm={setResetForm} resetRequested={resetRequested} requestReset={requestReset} confirmReset={confirmReset} error={error} info={info} />;
+  if (!me.profileComplete && me.role !== 'SUPER_ADMIN') return <ProfileCompletion api={api} me={me} setMe={setMe} logout={logout} setError={setError} setInfo={setInfo} error={error} info={info} />;
 
   const admin = me.role === 'SUPER_ADMIN';
   const quota = service.quota || dashboard.service?.quota || {};
   const subscription = service.subscription || dashboard.service?.subscription || null;
   const subPlans = (service.plans || []).filter(p => p.type === 'SUBSCRIPTION');
   const addons = (service.plans || []).filter(p => p.type === 'ADDON');
-  const nav = ['Tổng quan', 'Fanpage', 'Hộp thư', 'Sản phẩm', 'AI & Prompt', 'Gói dịch vụ', ...(admin ? ['Khách hàng', 'Đơn dịch vụ', 'Quản lý gói', 'OpenAI'] : [])];
+  const nav = ['Tổng quan', 'Fanpage', 'Hộp thư', 'Sản phẩm', 'AI & Prompt', 'Gói dịch vụ', 'Tài khoản', ...(admin ? ['Khách hàng', 'Đơn dịch vụ', 'Quản lý gói', 'OpenAI'] : [])];
 
-  return <div className="layout"><aside className="sidebar"><div className="logo">✦ MỘC TÂM AI <small>V2.1</small></div><div className="account"><b>{me.name}</b><span>{admin ? 'SUPER ADMIN' : me.email}</span></div>{nav.map(x => <button key={x} className={'nav ' + (tab === x ? 'active' : '')} onClick={() => setTab(x)}>{x}</button>)}<button className="nav logout" onClick={logout}>Đăng xuất</button></aside><main><div className="top"><div><h1>{tab}</h1><div className="sub">{admin ? 'Quản trị SaaS thương mại' : 'Facebook Messenger AI Auto Reply'}</div></div><div className="creditPill">{admin ? '∞ AI Unit' : `⚡ ${money(quota.availableUnits)} AI Unit`}</div></div>{error && <p className="error box">{error}</p>}{info && <p className="ok box">{info}</p>}
+  return <div className="layout"><aside className="sidebar"><div className="logo">✦ MỘC TÂM AI <small>V2.2</small></div><div className="account"><b>{me.name}</b><span>{admin ? 'SUPER ADMIN' : me.email}</span></div>{nav.map(x => <button key={x} className={'nav ' + (tab === x ? 'active' : '')} onClick={() => setTab(x)}>{x}</button>)}<button className="nav logout" onClick={logout}>Đăng xuất</button></aside><main><div className="top"><div><h1>{tab}</h1><div className="sub">{admin ? 'Quản trị SaaS thương mại' : 'Facebook Messenger AI Auto Reply'}</div></div><div className="creditPill">{admin ? '∞ AI Unit' : `⚡ ${money(quota.availableUnits)} AI Unit`}</div></div>{error && <p className="error box">{error}</p>}{info && <p className="ok box">{info}</p>}
 
   {tab === 'Tổng quan' && <><div className="stats">{[['Fanpage', dashboard.pages], ['Hội thoại', dashboard.conversations], ['Tin nhắn', dashboard.messages], ['Lượt AI', dashboard.aiRequests]].map(([t, v]) => <Stat key={t} title={t} value={money(v)} />)}</div>{!admin && <div className="grid2"><div className="card"><h2>{subscription ? `Gói ${subscription.planName}` : 'Chưa có gói dịch vụ'}</h2>{subscription ? <><QuotaBar quota={quota} /><p><b>{money(quota.availableUnits)}</b> / {money(quota.totalUnits)} AI Unit còn lại</p><p className="sub">Hết hạn: {dt(subscription.expiresAt)} · tối đa {subscription.maxPages} Fanpage bật AI</p></> : <p className="sub">Mua gói để bật AI cho Fanpage. Không có ví tiền, không có số dư rút/chuyển.</p>}<button className="btn" onClick={() => setTab('Gói dịch vụ')}>{subscription ? 'Quản lý gói' : 'Xem bảng giá'}</button></div><div className="card"><h2>Sử dụng AI</h2><p>Đã dùng trong hệ thống: <b>{money(dashboard.unitsUsed)} AI Unit</b></p><p className="sub">Mỗi câu trả lời thường dùng 1 AI Unit; hội thoại dài có thể dùng tối đa theo cấu hình hệ thống.</p></div></div>}{admin && <><div className="stats"><Stat title="Tài khoản" value={money(adminOverview.users)} /><Stat title="Page toàn hệ thống" value={money(adminOverview.pages)} /><Stat title="Thuê bao hoạt động" value={money(adminOverview.activeSubscriptions)} /><Stat title="Đơn chờ duyệt" value={money(adminOverview.pendingOrders)} /></div><div className="grid2"><div className="card"><h2>Doanh thu dịch vụ</h2><div className="big">{money(adminOverview.revenueVnd)}đ</div><p className="sub">Tổng các đơn đã duyệt. Không phải số dư ví người dùng.</p></div><div className="card"><h2>Chi phí AI</h2><div className="big">{money(Math.round(adminOverview.realAiCostVnd || 0))}đ</div><p className="sub">{money(adminOverview.aiRequests)} lượt gọi · {money(adminOverview.unitsConsumed)} AI Unit đã ghi nhận</p></div></div></>}</>}
 
@@ -85,6 +128,8 @@ export default function Home() {
 
   {tab === 'Gói dịch vụ' && <><div className="grid2"><div className="card"><h2>Gói hiện tại</h2>{admin ? <p className="sub">Super Admin không bị giới hạn AI Unit.</p> : subscription ? <><div className="big">{subscription.planName}</div><QuotaBar quota={quota} /><p>{money(quota.availableUnits)} AI Unit còn lại</p><p className="sub">Đã dùng {money(quota.usedUnits)} · đang xử lý {money(quota.reservedUnits)} · hết hạn {dt(subscription.expiresAt)}</p></> : <><div className="big">Chưa kích hoạt</div><p className="sub">Chọn một gói thuê bao bên dưới để sử dụng AI.</p></>}</div><div className="card"><h2>Mô hình thanh toán</h2><p>Đây là phí mua <b>dịch vụ và hạn mức AI</b>, không phải nạp tiền vào ví.</p><p className="sub">AI Unit không rút tiền, không chuyển cho user khác và hết hiệu lực cùng kỳ thuê bao. Add-on chỉ bổ sung lượt AI cho kỳ đang hoạt động.</p></div></div><h2>Gói thuê bao 30 ngày</h2><div className="packageGrid">{subPlans.map(p => <PlanCard key={p.id} plan={p} onBuy={() => save('/api/service-orders', 'POST', { planId: p.id }, 'Đã tạo đơn dịch vụ. Chờ quản trị viên xác nhận thanh toán.')} />)}</div><h2>Add-on lượt AI</h2><div className="packageGrid">{addons.map(p => <PlanCard key={p.id} plan={p} addon disabled={!admin && !subscription} onBuy={() => save('/api/service-orders', 'POST', { planId: p.id }, 'Đã tạo đơn add-on. Chờ quản trị viên xác nhận thanh toán.')} />)}</div><div className="card"><h2>Đơn dịch vụ</h2><Table rows={(service.orders || []).map(o => [o.paymentCode, o.planName, money(o.amountVnd) + 'đ', money(o.units) + ' Unit', o.status, dt(o.createdAt)])} headers={['Mã', 'Gói', 'Giá', 'Hạn mức', 'Trạng thái', 'Tạo lúc']} /></div>{!admin && <div className="card"><h2>Lịch sử AI Unit</h2><Table rows={(service.transactions || []).slice(0, 50).map(t => [dt(t.createdAt), t.type, (t.units > 0 ? '+' : '') + money(t.units), money(t.availableAfter), t.description || ''])} headers={['Thời gian', 'Loại', 'Biến động', 'Còn lại', 'Nội dung']} /></div>}</>}
 
+  {tab === 'Tài khoản' && <AccountSecurity api={api} me={me} setMe={setMe} setError={setError} setInfo={setInfo} />}
+
   {admin && tab === 'Khách hàng' && <div className="card"><h2>Tài khoản khách hàng</h2><AdminUsers users={users} me={me} plans={adminPlans.filter(p => p.type === 'SUBSCRIPTION' && p.active)} save={save} /></div>}
 
   {admin && tab === 'Đơn dịch vụ' && <div className="card"><h2>Đơn mua gói / add-on</h2><Table headers={['Khách hàng', 'Mã', 'Gói', 'Số tiền', 'AI Unit', 'Trạng thái', 'Thao tác']} rows={adminOrders.map(o => [<><b>{o.user.name}</b><div className="sub compact">{o.user.email}</div></>, o.paymentCode, `${o.planName} · ${o.planType}`, money(o.amountVnd) + 'đ', money(o.units), o.status, o.status === 'PENDING' ? <><button className="mini green" onClick={() => save('/api/admin/service-orders/' + o.id + '/approve', 'POST', {}, 'Đã duyệt và kích hoạt dịch vụ')}>Duyệt</button> <button className="mini" onClick={() => save('/api/admin/service-orders/' + o.id + '/cancel', 'POST', {})}>Hủy</button></> : '—'])} /></div>}
@@ -95,6 +140,44 @@ export default function Home() {
   </main></div>;
 }
 
+function AuthScreen({ mode, setMode, authForm, setAuthForm, submitAuth, pendingSignup, signupCode, setSignupCode, verifySignup, resendSignup, resetForm, setResetForm, resetRequested, requestReset, confirmReset, error, info }) {
+  if (mode === 'verify' && pendingSignup) return <div className="authPage"><div className="authCard"><div className="brand">✦ MỘC TÂM AI</div><h1>Xác minh tài khoản</h1><p className="sub">Nhập mã 6 số đã gửi tới {pendingSignup.destination}</p>{error && <p className="error box">{error}</p>}{info && <p className="ok box">{info}</p>}<form onSubmit={verifySignup}><label>Mã xác nhận<input inputMode="numeric" maxLength={6} value={signupCode} onChange={e => setSignupCode(e.target.value.replace(/\D/g, ''))} required /></label><button className="btn wide" type="submit">Xác minh & đăng nhập</button></form><button className="linkBtn" onClick={() => resendSignup(pendingSignup.channel)}>Gửi lại mã</button><button className="linkBtn" onClick={() => setMode('register')}>Quay lại đăng ký</button></div></div>;
+  if (mode === 'forgot') return <div className="authPage"><div className="authCard"><div className="brand">✦ MỘC TÂM AI</div><h1>Quên mật khẩu</h1><p className="sub">Nhận mã xác nhận qua email hoặc số điện thoại đã xác minh.</p>{error && <p className="error box">{error}</p>}{info && <p className="ok box">{info}</p>}{!resetRequested ? <form onSubmit={requestReset}><label>Email hoặc số điện thoại<input value={resetForm.identifier} onChange={e => setResetForm({ ...resetForm, identifier: e.target.value })} required /></label><label>Nhận mã qua<select value={resetForm.channel} onChange={e => setResetForm({ ...resetForm, channel: e.target.value })}><option value="EMAIL">Email</option><option value="SMS">SMS</option></select></label><button className="btn wide" type="submit">Gửi mã xác nhận</button></form> : <form onSubmit={confirmReset}><label>Mã xác nhận<input inputMode="numeric" maxLength={6} value={resetForm.code} onChange={e => setResetForm({ ...resetForm, code: e.target.value.replace(/\D/g, '') })} required /></label><label>Mật khẩu mới<input type="password" minLength={10} value={resetForm.newPassword} onChange={e => setResetForm({ ...resetForm, newPassword: e.target.value })} required /></label><button className="btn wide" type="submit">Đặt mật khẩu mới</button></form>}<button className="linkBtn" onClick={() => setMode('login')}>Quay lại đăng nhập</button></div></div>;
+  const register = mode === 'register';
+  return <div className="authPage"><div className="authCard"><div className="brand">✦ MỘC TÂM AI</div><h1>{register ? 'Tạo tài khoản' : 'Đăng nhập'}</h1><p className="sub">Facebook Messenger AI · V2.2 Commerce</p>{error && <p className="error box">{error}</p>}{info && <p className="ok box">{info}</p>}<div className="socialButtons"><a className="socialBtn google" href={BASE + '/auth/social/google/start'}><span className="socialIcon">G</span>{register ? 'Đăng ký' : 'Đăng nhập'} bằng Google</a><a className="socialBtn facebook" href={BASE + '/auth/social/facebook/start'}><span className="socialIcon">f</span>{register ? 'Đăng ký' : 'Đăng nhập'} bằng Facebook</a></div><div className="socialDivider"><span>hoặc dùng tài khoản Mộc Tâm AI</span></div><form onSubmit={submitAuth}>{register ? <><label>Họ tên<input value={authForm.name} onChange={e => setAuthForm({ ...authForm, name: e.target.value })} required /></label><label>Email<input type="email" value={authForm.email} onChange={e => setAuthForm({ ...authForm, email: e.target.value })} required /></label><label>Số điện thoại<input type="tel" placeholder="0912 345 678" value={authForm.phone} onChange={e => setAuthForm({ ...authForm, phone: e.target.value })} required /></label><label>Xác minh đăng ký qua<select value={authForm.verificationChannel} onChange={e => setAuthForm({ ...authForm, verificationChannel: e.target.value })}><option value="EMAIL">Email</option><option value="SMS">SMS</option></select></label></> : <label>Email hoặc số điện thoại<input value={authForm.identifier} onChange={e => setAuthForm({ ...authForm, identifier: e.target.value })} required /></label>}<label>Mật khẩu<input type="password" minLength={10} value={authForm.password} onChange={e => setAuthForm({ ...authForm, password: e.target.value })} required /></label><button className="btn wide" type="submit">{register ? 'Đăng ký' : 'Đăng nhập'}</button></form>{!register && <button className="linkBtn" onClick={() => setMode('forgot')}>Quên mật khẩu?</button>}<button className="linkBtn" onClick={() => { setMode(register ? 'login' : 'register'); }}>{register ? 'Đã có tài khoản? Đăng nhập' : 'Chưa có tài khoản? Đăng ký'}</button><p className="authLegal">Email và số điện thoại là bắt buộc. Bằng việc tiếp tục, bạn đồng ý với <a href="/terms">Điều khoản dịch vụ</a> và <a href="/privacy">Chính sách quyền riêng tư</a>.</p></div></div>;
+}
+
+function ProfileCompletion({ api, me, setMe, logout, setError, setInfo, error, info }) {
+  const [phone, setPhone] = useState(me.phone || ''), [code, setCode] = useState(''), [requested, setRequested] = useState(false);
+  async function request() { try { const out = await api('/api/account/contact/request', 'POST', { field: 'phone', value: phone }); setRequested(true); setInfo(`Mã xác nhận đã gửi tới ${out.destination}` + (out.devCode ? ` · DEV: ${out.devCode}` : '')); setError(''); } catch (e) { setError(e.message); } }
+  async function confirm() { try { const out = await api('/api/account/contact/confirm', 'POST', { field: 'phone', value: phone, code }); setMe(out.user); setInfo('Đã hoàn tất thông tin tài khoản'); setError(''); } catch (e) { setError(e.message); } }
+  return <div className="authPage"><div className="authCard"><div className="brand">✦ MỘC TÂM AI</div><h1>Hoàn tất tài khoản</h1><p className="sub">Tài khoản thương mại yêu cầu cả email và số điện thoại. Email: <b>{me.email}</b></p>{error && <p className="error box">{error}</p>}{info && <p className="ok box">{info}</p>}<label>Số điện thoại<input value={phone} onChange={e => setPhone(e.target.value)} placeholder="0912 345 678" /></label>{requested && <label>Mã SMS<input inputMode="numeric" maxLength={6} value={code} onChange={e => setCode(e.target.value.replace(/\D/g, ''))} /></label>}<button className="btn wide" onClick={requested ? confirm : request}>{requested ? 'Xác nhận số điện thoại' : 'Gửi mã SMS'}</button><button className="linkBtn" onClick={logout}>Đăng xuất</button></div></div>;
+}
+
+function AccountSecurity({ api, me, setMe, setError, setInfo }) {
+  const [account, setAccount] = useState(null), [sessions, setSessions] = useState([]);
+  const [name, setName] = useState(me.name || '');
+  const [contact, setContact] = useState({ field: 'email', value: me.email || '', currentPassword: '', code: '', requested: false });
+  const [pw, setPw] = useState({ currentPassword: '', newPassword: '', channel: me.emailVerified ? 'EMAIL' : 'SMS', code: '', requested: false });
+
+  const load = useCallback(async () => { try { const [a, s] = await Promise.all([api('/api/account'), api('/api/account/sessions')]); setAccount(a); setSessions(s); setName(a.user.name); } catch (e) { setError(e.message); } }, [api, setError]);
+  useEffect(() => { load(); }, [load]);
+
+  async function saveName() { try { const out = await api('/api/account/profile', 'PATCH', { name }); setMe(out.user); setInfo('Đã cập nhật họ tên'); setError(''); await load(); } catch (e) { setError(e.message); } }
+  async function requestContact(field, value) { try { const out = await api('/api/account/contact/request', 'POST', { field, value, currentPassword: contact.currentPassword }); setContact({ ...contact, field, value, requested: true, code: '' }); setInfo(`Mã xác nhận đã gửi tới ${out.destination}` + (out.devCode ? ` · DEV: ${out.devCode}` : '')); setError(''); } catch (e) { setError(e.message); } }
+  async function confirmContact() { try { const out = await api('/api/account/contact/confirm', 'POST', { field: contact.field, value: contact.value, code: contact.code }); setMe(out.user); setContact({ field: 'email', value: out.user.email, currentPassword: '', code: '', requested: false }); setInfo('Đã cập nhật thông tin liên hệ'); setError(''); await load(); } catch (e) { setError(e.message); } }
+  async function requestPasswordCode() { try { const out = await api('/api/account/password/change/request', 'POST', { currentPassword: pw.currentPassword, channel: pw.channel }); setPw({ ...pw, requested: true, code: '' }); setInfo(`Mã xác nhận đã gửi tới ${out.destination}` + (out.devCode ? ` · DEV: ${out.devCode}` : '')); setError(''); } catch (e) { setError(e.message); } }
+  async function changePassword() { try { const out = await api('/api/account/password/change/confirm', 'POST', pw); setMe(out.user); setPw({ currentPassword: '', newPassword: '', channel: out.user.emailVerified ? 'EMAIL' : 'SMS', code: '', requested: false }); setInfo('Đã đổi mật khẩu và đăng xuất các thiết bị khác'); setError(''); await load(); } catch (e) { setError(e.message); } }
+  async function revoke(id) { try { const out = await api('/api/account/sessions/' + id, 'DELETE'); if (out.currentRevoked) window.location.reload(); else { setInfo('Đã đăng xuất phiên'); await load(); } } catch (e) { setError(e.message); } }
+  async function revokeOthers() { try { const out = await api('/api/account/sessions/revoke-others', 'POST', {}); setInfo(`Đã đăng xuất ${out.revoked} phiên khác`); await load(); } catch (e) { setError(e.message); } }
+
+  const u = account?.user || me;
+  return <><div className="grid2"><div className="card"><h2>Thông tin tài khoản</h2><label>Họ tên<input value={name} onChange={e => setName(e.target.value)} /></label><button className="btn" onClick={saveName}>Lưu họ tên</button><div className="contactLine"><div><b>Email</b><div>{u.email} <VerifyBadge ok={u.emailVerified} /></div></div><button className="mini" onClick={() => setContact({ field: 'email', value: u.email, currentPassword: '', code: '', requested: false })}>Quản lý</button></div><div className="contactLine"><div><b>Số điện thoại</b><div>{u.phone || 'Chưa có'} <VerifyBadge ok={u.phoneVerified} /></div></div><button className="mini" onClick={() => setContact({ field: 'phone', value: u.phone || '', currentPassword: '', code: '', requested: false })}>Quản lý</button></div><p className="sub compact">Email và số điện thoại là bắt buộc nên không thể xóa trắng; bạn có thể thay bằng giá trị mới sau khi xác minh.</p></div><div className="card"><h2>Đăng nhập liên kết</h2>{(account?.oauthAccounts || []).length ? account.oauthAccounts.map((x, i) => <div className="row" key={i}><b>{x.provider === 'google' ? 'Google' : 'Facebook'}</b><span>{x.providerEmail || 'Đã liên kết'}</span></div>) : <p className="sub">Chưa liên kết Google/Facebook.</p>}<div className="socialButtons compactSocial"><a className="socialBtn google" href={BASE + '/auth/social/google/start'}>G &nbsp; Liên kết Google</a><a className="socialBtn facebook" href={BASE + '/auth/social/facebook/start'}>f &nbsp; Liên kết Facebook</a></div></div></div>
+  <div className="grid2"><div className="card"><h2>Thay đổi / xác minh {contact.field === 'email' ? 'email' : 'số điện thoại'}</h2><label>Loại<select value={contact.field} onChange={e => setContact({ field: e.target.value, value: e.target.value === 'email' ? u.email : (u.phone || ''), currentPassword: '', code: '', requested: false })}><option value="email">Email</option><option value="phone">Số điện thoại</option></select></label><label>Giá trị mới<input value={contact.value} onChange={e => setContact({ ...contact, value: e.target.value })} /></label>{u.hasPassword && contact.value !== (contact.field === 'email' ? u.email : u.phone) && <label>Mật khẩu hiện tại<input type="password" value={contact.currentPassword} onChange={e => setContact({ ...contact, currentPassword: e.target.value })} /></label>}{contact.requested && <label>Mã xác nhận<input inputMode="numeric" maxLength={6} value={contact.code} onChange={e => setContact({ ...contact, code: e.target.value.replace(/\D/g, '') })} /></label>}<div className="actions"><button className="btn" onClick={() => contact.requested ? confirmContact() : requestContact(contact.field, contact.value)}>{contact.requested ? 'Xác nhận thay đổi' : 'Gửi mã xác nhận'}</button>{contact.requested && <button className="btn gray" onClick={() => setContact({ ...contact, requested: false, code: '' })}>Nhập lại</button>}</div></div><div className="card"><h2>{u.hasPassword ? 'Đổi mật khẩu' : 'Tạo mật khẩu'}</h2>{u.hasPassword && <label>Mật khẩu hiện tại<input type="password" value={pw.currentPassword} onChange={e => setPw({ ...pw, currentPassword: e.target.value })} /></label>}<label>Mật khẩu mới<input type="password" minLength={10} value={pw.newPassword} onChange={e => setPw({ ...pw, newPassword: e.target.value })} /></label><label>Nhận mã qua<select value={pw.channel} onChange={e => setPw({ ...pw, channel: e.target.value })}><option value="EMAIL" disabled={!u.emailVerified}>Email {u.emailVerified ? '' : '(chưa xác minh)'}</option><option value="SMS" disabled={!u.phoneVerified}>SMS {u.phoneVerified ? '' : '(chưa xác minh)'}</option></select></label>{pw.requested && <label>Mã xác nhận<input inputMode="numeric" maxLength={6} value={pw.code} onChange={e => setPw({ ...pw, code: e.target.value.replace(/\D/g, '') })} /></label>}<button className="btn" onClick={pw.requested ? changePassword : requestPasswordCode}>{pw.requested ? 'Xác nhận đổi mật khẩu' : 'Gửi mã xác nhận'}</button><p className="sub compact">Khi đổi mật khẩu, hệ thống kiểm tra mật khẩu cũ (nếu có), xác minh OTP và tự đăng xuất tất cả thiết bị khác.</p></div></div>
+  <div className="card"><div className="row"><div><h2>Phiên đăng nhập</h2><p className="sub compact">Theo dõi thiết bị đang đăng nhập và thu hồi phiên lạ.</p></div><button className="btn gray" onClick={revokeOthers}>Đăng xuất thiết bị khác</button></div>{sessions.map(s => <div className="sessionRow" key={s.id}><div><b>{s.deviceName || 'Thiết bị'}</b>{s.current && <span className="tag greenTag">Phiên hiện tại</span>}<div className="sub compact">IP {s.ipAddress || '—'} · hoạt động {dt(s.lastSeenAt)} · hết hạn {dt(s.expiresAt)}</div></div><button className="mini" onClick={() => revoke(s.id)}>{s.current ? 'Đăng xuất' : 'Thu hồi'}</button></div>)}</div></>;
+}
+
+function VerifyBadge({ ok }) { return <span className={'verifyBadge ' + (ok ? 'verified' : 'unverified')}>{ok ? '✓ Đã xác minh' : 'Chưa xác minh'}</span>; }
 function Stat({ title, value }) { return <div className="card"><div className="sub compact">{title}</div><div className="stat">{value ?? '—'}</div></div>; }
 function Table({ headers, rows }) { return <div className="tableWrap"><table><thead><tr>{headers.map(h => <th key={h}>{h}</th>)}</tr></thead><tbody>{rows.length ? rows.map((r, i) => <tr key={i}>{r.map((c, j) => <td key={j}>{c}</td>)}</tr>) : <tr><td colSpan={headers.length} className="sub">Chưa có dữ liệu</td></tr>}</tbody></table></div>; }
 function Prompt({ page, save }) { const [prompt, setPrompt] = useState(page.prompt); return <div className="promptBlock"><h3>{page.name}</h3><textarea value={prompt} onChange={e => setPrompt(e.target.value)} /><button className="btn" onClick={() => save('/api/pages/' + page.id, 'PATCH', { prompt })}>Lưu prompt</button></div>; }
@@ -105,7 +188,7 @@ function AdminUsers({ users, me, plans, save }) {
   return <Table headers={['Khách hàng', 'Quyền', 'Gói hiện tại', 'Page', 'AI', 'Trạng thái', 'Thao tác']} rows={users.map(u => {
     const s = u.subscriptions?.[0];
     const available = s ? Math.max(0, s.baseUnits + s.addonUnits - s.usedUnits - s.reservedUnits) : 0;
-    return [<><b>{u.name}</b><div className="sub compact">{u.email}</div></>, u.role, s ? <><b>{s.planName}</b><div className="sub compact">{money(available)} Unit còn lại · hết {dt(s.expiresAt)}</div></> : 'Chưa có gói', u._count.pages, u._count.aiUsages, u.status, <div className="adminActions"><select id={'plan-' + u.id} defaultValue=""><option value="">Chọn gói…</option>{plans.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select><button className="mini green" onClick={() => { const planId = document.getElementById('plan-' + u.id)?.value; if (planId) save('/api/admin/users/' + u.id + '/grant-plan', 'POST', { planId }, 'Đã gán gói dịch vụ'); }}>Gán gói</button><button className="mini" disabled={!s} onClick={() => { const v = prompt('AI Unit bổ sung cần cộng (số âm để trừ add-on):'); if (v) save('/api/admin/users/' + u.id + '/quota', 'POST', { amount: Number(v), description: 'Super Admin điều chỉnh quota' }); }}>± Unit</button><button className="mini" disabled={u.id === me.id} onClick={() => save('/api/admin/users/' + u.id, 'PATCH', { status: u.status === 'ACTIVE' ? 'SUSPENDED' : 'ACTIVE' })}>{u.status === 'ACTIVE' ? 'Khóa' : 'Mở'}</button></div>];
+    return [<><b>{u.name}</b><div className="sub compact">{u.email}{u.phone ? ` · ${u.phone}` : ''}</div></>, u.role, s ? <><b>{s.planName}</b><div className="sub compact">{money(available)} Unit còn lại · hết {dt(s.expiresAt)}</div></> : 'Chưa có gói', u._count.pages, u._count.aiUsages, u.status, <div className="adminActions"><select id={'plan-' + u.id} defaultValue=""><option value="">Chọn gói…</option>{plans.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select><button className="mini green" onClick={() => { const planId = document.getElementById('plan-' + u.id)?.value; if (planId) save('/api/admin/users/' + u.id + '/grant-plan', 'POST', { planId }, 'Đã gán gói dịch vụ'); }}>Gán gói</button><button className="mini" disabled={!s} onClick={() => { const v = prompt('AI Unit bổ sung cần cộng (số âm để trừ add-on):'); if (v) save('/api/admin/users/' + u.id + '/quota', 'POST', { amount: Number(v), description: 'Super Admin điều chỉnh quota' }); }}>± Unit</button><button className="mini" disabled={u.id === me.id} onClick={() => save('/api/admin/users/' + u.id, 'PATCH', { status: u.status === 'ACTIVE' ? 'SUSPENDED' : 'ACTIVE' })}>{u.status === 'ACTIVE' ? 'Khóa' : 'Mở'}</button></div>];
   })} />;
 }
 
