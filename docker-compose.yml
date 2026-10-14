@@ -25,7 +25,9 @@ services:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
     restart: unless-stopped
     env_file: .env
-    command: sh -c "npx prisma db push && node server/src/api.js"
+    command: sh -c "npx prisma db push && NODE_OPTIONS=--require=/app/server/src/meta-observability.js node server/src/api.js"
+    volumes:
+      - meta_logs:/app/logs
     ports: ["127.0.0.1:4000:4000"]
     depends_on:
       postgres: {condition: service_healthy}
@@ -35,7 +37,9 @@ services:
     image: chatbotai-app:latest
     restart: unless-stopped
     env_file: .env
-    command: node server/src/worker.js
+    command: sh -c "NODE_OPTIONS=--require=/app/server/src/meta-observability.js node server/src/worker.js"
+    volumes:
+      - meta_logs:/app/logs
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_started}
@@ -49,3 +53,4 @@ services:
 
 volumes:
   postgres_data:
+  meta_logs:
